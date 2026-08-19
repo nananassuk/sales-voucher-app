@@ -2365,7 +2365,36 @@ function scopeRecords(bizKey){
 /* 환불(은행 항목 마이너스) 건을 매출 건과 분리 */
 function partitionRefunds(records, bizKey){
   var sales = [], refunds = [];
+  // 은행(계좌) +/- 상쇄쌍 넷팅: 동일 학생·동일 일자·동일 품목 조합에서 은행 값이 양수/음수로 나뉘어
+  // 찍혀있는 경우(현금영수증 변경 등 단순 정정), 순액 기준으로만 매출/환불을 판단한다.
+  // 순액이 0 이상이면 매출로(그대로 두면 자연히 상쇄), 순액이 음수면 그 그룹 전체를 환불로 보낸다
+  // (netRefunds가 품목 단위로 다시 합산해줘서 결과적으로 순액만 환불로 잡힘).
+  var bankGroupKeyOf = function(r){
+    var itemKey = Object.keys(r.items).sort().join(',');
+    return studentIdOf(r)+'|'+r.date+'|'+itemKey;
+  };
+  var bankGroups = {};
   records.forEach(function(r){
+    if(!r.bank) return;
+    var key = bankGroupKeyOf(r);
+    (bankGroups[key] = bankGroups[key] || []).push(r);
+  });
+  var forceRefundIds = {}, forceSalesIds = {};
+  Object.keys(bankGroups).forEach(function(key){
+    var group = bankGroups[key];
+    var hasPos = group.some(function(r){ return r.bank>0; });
+    var hasNeg = group.some(function(r){ return r.bank<0; });
+    if(!(hasPos && hasNeg)) return; // 상쇄쌍이 아니면(전부 같은 부호) 원래 로직 그대로
+    var netBank = group.reduce(function(s,r){ return s+r.bank; }, 0);
+    group.forEach(function(r){
+      if(netBank >= -0.5) forceSalesIds[r.id] = true; // 순액 0 이상 -> 전부 매출(자연 상쇄)
+      else forceRefundIds[r.id] = true; // 순액 음수 -> 전부 환불(netRefunds가 순액으로 재합산)
+    });
+  });
+
+  records.forEach(function(r){
+    if(forceSalesIds[r.id]){ sales.push(r); return; }
+    if(forceRefundIds[r.id]){ r.refundSource = 'bank'; refunds.push(r); return; }
     // 환불(계좌 취소)은 은행 항목 마이너스만 해당. 카드 마이너스는 원래 카드 취소(넷팅)일 뿐 매출로 합산되지만,
     // "입금취소"로 직접 표시한 건은 상계할 대상이 없는 실제 환불이므로 여기서 제외해 환불로 이동시킴.
     if(r.bank < 0){ r.refundSource = 'bank'; refunds.push(r); return; }
