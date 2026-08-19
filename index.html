@@ -531,10 +531,10 @@ function combinedCategoryLabel(bizKey, cat){
   return cat;
 }
 var COMBINED_CATEGORY_ORDER = ['교습비','기숙사비','식비','모의고사비','단과','독서실비_퀀텀1','독서실비_퀀텀2','기타'];
-/* 구분별 합계(차변용)에서는 교습비+기숙사비+식비+모의고사비를 "수강료"로 묶어서 표시 */
-var TUITION_GROUP = ['교습비','기숙사비','식비','모의고사비'];
+/* 구분별 합계(차변용)에서는 교습비+기숙사비+식비+모의고사비+단과를 "수강료"로 묶어서 표시 */
+var TUITION_GROUP = ['교습비','기숙사비','식비','모의고사비','단과'];
 function groupLabel(cat){ return TUITION_GROUP.indexOf(cat)>=0 ? '수강료' : cat; }
-var GROUP_SUMMARY_ORDER = ['수강료','단과','독서실','독서실비_퀀텀1','독서실비_퀀텀2','기타'];
+var GROUP_SUMMARY_ORDER = ['수강료','독서실','독서실비_퀀텀1','독서실비_퀀텀2','기타'];
 function groupSortLabels(labels){
   return labels.slice().sort(function(a,b){
     var ia = GROUP_SUMMARY_ORDER.indexOf(a); var ib = GROUP_SUMMARY_ORDER.indexOf(b);
@@ -2885,7 +2885,7 @@ function renderCombined(wrap, loaded){
   });
   var cardHtml = renderCardSalesBlock(
     '외상매출 작성용(취합)',
-    '수강료(교습비+기숙사비+식비+모의고사비) + 단과 + 독서실비_퀀텀1 + 독서실비_퀀텀2로 나뉘고, VAN은 매출/환불이 별도 행으로, PG는 카드사 구분 없이 넷팅된 값 그대로 표시됩니다.',
+    '수강료(교습비+기숙사비+식비+모의고사비+단과) + 독서실비_퀀텀1 + 독서실비_퀀텀2로 나뉘고, VAN은 매출/환불이 별도 행으로, PG는 카드사 구분 없이 넷팅된 값 그대로 표시됩니다.',
     groupSortLabels(Object.keys(groupedCardData)),
     function(label){ return {va: groupedCardVa[label]||0, vaRefund: groupedVaRefund[label]||0, van: groupedCardData[label].van, pg: groupedCardData[label].pg}; },
     grandTotals.card,
@@ -2989,7 +2989,7 @@ function renderCombined(wrap, loaded){
     var cardCancelCountAll = allRefundEntries.filter(function(e){ return e.source==='card_cancel'; }).length;
     refundHtml = '<div class="card" style="border-color:'+(allRefundEntries.length?'var(--bad)':'var(--line-strong)')+'"><div class="section-title" style="color:'+(allRefundEntries.length?'var(--bad)':'var(--ink)')+'">환불 내역(취합)'+
       '<span class="badge" style="background:'+(allRefundEntries.length?'var(--bad-soft)':'#f3f4f6')+';color:'+(allRefundEntries.length?'var(--bad)':'var(--ink-soft)')+'">'+allRefundEntries.length+'건'+(allRefundEntries.length?' · '+fmt(Math.abs(refundSum)):'')+'</span></div>'+
-      '<div class="hint">사업장별 은행 마이너스(은행환불) 건 + "입금취소" 표시한 카드 취소건(카드입금취소)을 모두 모았습니다. 아래 구분별 합계는 수강료(교습비+기숙사비+식비+모의고사비)로 묶어서 보여줍니다.</div>'+
+      '<div class="hint">사업장별 은행 마이너스(은행환불) 건 + "입금취소" 표시한 카드 취소건(카드입금취소)을 모두 모았습니다. 아래 구분별 합계는 수강료(교습비+기숙사비+식비+모의고사비+단과)로 묶어서 보여줍니다.</div>'+
       summaryBadgesHtmlAll +
       refundGroupSummaryHtml + bankBreakdownHtml + cardCancelBreakdownHtml +
       '<div style="display:flex;gap:16px;flex-wrap:wrap;">'+
@@ -3984,7 +3984,7 @@ function renderResults(){
     '</div>'+
   '</div>';
 
-  /* 구분별 합계 (상단, 차변용 — 교습비+기숙사비+식비+모의고사비는 "수강료"로 합산) */
+  /* 구분별 합계 (상단, 차변용 — 교습비+기숙사비+식비+모의고사비+단과는 "수강료"로 합산) */
   var groupTotals = buildGroupTotals(agg.catTotals);
   var catSummaryHtml = '<div class="tableWrap" style="margin-bottom:14px;"><table class="summaryTable"><thead><tr>'+
     '<th style="text-align:left">구분</th><th>가상계좌</th><th>카드</th><th>현금</th><th>은행</th><th>승인금액(합계)</th>'+
@@ -4058,7 +4058,7 @@ function renderResults(){
           (check.mismatches.length ? ' · 상세내역 합과 승인금액이 다른 건 '+check.mismatches.length+'건(거래내역표에서 확인)' : ''))+
     '</div></div>';
 
-  /* 카드 외상매출 작성용: VAN은 매출/환불 별도 표시, PG는 넷팅 그대로. 수강료(교습비+기숙사비+식비+모의고사비)로 묶어서 총합도 같이 보여줌 */
+  /* 카드 외상매출 작성용: VAN은 매출/환불 별도 표시, PG는 넷팅 그대로. 수강료(교습비+기숙사비+식비+모의고사비+단과)로 묶어서 총합도 같이 보여줌 */
   var cardCatsPresent = CATEGORIES.filter(function(c){ return agg.cardSales[c]; });
   var groupedVa = {}, groupedVaRefund = {}, groupedCardData = {};
   cardCatsPresent.forEach(function(c){
@@ -4075,7 +4075,7 @@ function renderResults(){
   });
   var cardSalesHtml = renderCardSalesBlock(
     '외상매출 작성용',
-    '수강료(교습비+기숙사비+식비+모의고사비)로 묶은 총합이 함께 표시됩니다. VAN은 매출/환불이 별도 행으로, PG는 카드사 구분 없이 넷팅된 값 그대로 표시됩니다.',
+    '수강료(교습비+기숙사비+식비+모의고사비+단과)로 묶은 총합이 함께 표시됩니다. VAN은 매출/환불이 별도 행으로, PG는 카드사 구분 없이 넷팅된 값 그대로 표시됩니다.',
     groupSortLabels(Object.keys(groupedCardData)),
     function(label){ return {va: groupedVa[label]||0, vaRefund: groupedVaRefund[label]||0, van: groupedCardData[label].van, pg: groupedCardData[label].pg}; },
     totals.card,
