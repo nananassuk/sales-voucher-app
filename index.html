@@ -547,8 +547,9 @@ function buildGroupTotals(catTotals){
   Object.keys(catTotals).forEach(function(cat){
     var label = groupLabel(cat);
     var t = catTotals[cat];
-    var g = groups[label] = groups[label] || {va:0,card:0,cash:0,bank:0,total:0};
+    var g = groups[label] = groups[label] || {va:0,card:0,cash:0,bank:0,total:0,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
     g.va+=t.va; g.card+=t.card; g.cash+=t.cash; g.bank+=t.bank; g.total+=t.total;
+    g.vaTaxAmt+=(t.vaTaxAmt||0); g.vaVat+=(t.vaVat||0); g.cardTaxAmt+=(t.cardTaxAmt||0); g.cardVat+=(t.cardVat||0);
   });
   return groups;
 }
@@ -1075,6 +1076,41 @@ function splitTax(total){
   var t = Math.round(total/1.1);
   var vat = total - t;
   return {taxAmt:t, vat:vat};
+}
+/* 과세사업장(퀀텀2)은 거래(레코드) 단위로 반올림한 뒤 합산해야 실제 세무 처리와 일치한다
+   (전체 합계를 먼저 낸 뒤 한 번에 나누면 반올림 오차가 누적되어 값이 달라짐 — 실제 파일로 확인된 차이).
+   그래서 업로드 시점에 레코드마다 taxAmt/vat를 미리 계산해서 붙여두고, 이후에는 이 필드들을 그대로 합산만 한다. */
+function tagRecordTax(bizKey, records){
+  var taxed = BIZ[bizKey] && BIZ[bizKey].taxed;
+  records.forEach(function(r){
+    if(taxed){
+      var t = splitTax(r.approvalAmt);
+      r.taxAmt = t.taxAmt; r.vat = t.vat;
+    } else {
+      r.taxAmt = 0; r.vat = 0;
+    }
+  });
+}
+function sumTax(records){
+  var taxAmt=0, vat=0;
+  records.forEach(function(r){ taxAmt += (r.taxAmt||0); vat += (r.vat||0); });
+  return {taxAmt:taxAmt, vat:vat};
+}
+/* 가상계좌/카드로 나눠서 과세금액을 볼 때도 레코드 단위 반올림값을 그대로 채널별로 합산한다(레코드는
+   보통 va 또는 card 중 하나로만 결제되므로, 그 레코드의 전체 taxAmt/vat를 해당 채널에 통째로 더한다). */
+function sumTaxByChannel(records){
+  var va = {taxAmt:0, vat:0}, card = {taxAmt:0, vat:0};
+  records.forEach(function(r){
+    if(r.va && !r.card){ va.taxAmt += (r.taxAmt||0); va.vat += (r.vat||0); }
+    else if(r.card && !r.va){ card.taxAmt += (r.taxAmt||0); card.vat += (r.vat||0); }
+    else if(r.va || r.card){
+      // 드물게 한 거래에 va/card가 섞여있으면 금액 비중대로 배분(둘 다 0이 아닐 때만 해당)
+      var denom = r.va + r.card;
+      va.taxAmt += (r.taxAmt||0)*(r.va/denom); va.vat += (r.vat||0)*(r.va/denom);
+      card.taxAmt += (r.taxAmt||0)*(r.card/denom); card.vat += (r.vat||0)*(r.card/denom);
+    }
+  });
+  return {va:va, card:card};
 }
 
 /* ---------------------------------------------------------------
@@ -1837,6 +1873,7 @@ function handleUpload(bizKey, file){
       return;
     }
     tagAcademicYear(newRecords);
+    tagRecordTax(bizKey, newRecords);
     var byDate = groupByDate(newRecords);
     var dates = Object.keys(byDate);
     var conflicts = [];      // {date, diffs, newRecs}
@@ -1905,6 +1942,7 @@ function finalizeBizLoad(bizKey){
     var all = [];
     arrs.forEach(function(a){ all = all.concat(a); });
     all.sort(function(a,b){ return a.date===b.date ? (a.ts<b.ts?-1:1) : (a.date<b.date?-1:1); });
+    tagRecordTax(bizKey, all); // 예전에 저장된 레코드는 taxAmt/vat가 없을 수 있어 로드 시점에 다시 계산해서 채워둠
     state.biz[bizKey].records = all;
     var dateSet = {};
     all.forEach(function(r){ dateSet[r.date]=1; });
@@ -2526,7 +2564,7 @@ function dateSummaries(bizKey){
     var t = paymentTotals(recs);
     var out = {date:d, count:recs.length, va:t.va, card:t.card, cash:t.cash, bank:t.bank, approvalAmt:t.approvalAmt};
     if(BIZ[bizKey].taxed){
-      var tax = splitTax(t.approvalAmt);
+      var tax = sumTax(recs);
       out.taxAmt = tax.taxAmt; out.vat = tax.vat;
     }
     return out;
@@ -2537,7 +2575,7 @@ function dateSummaries(bizKey){
    records는 환불이 제외된 매출 건만 들어와야 함 */
 function aggregate(bizKey, records){
   var rows = {};       // "품목명|결제수단" -> {itemName, method, category, amount, payers:{}}
-  var catTotals = {};  // category -> {va,card,cash,bank,total}
+  var catTotals = {};  // category -> {va,card,cash,bank,total, vaTaxAmt,vaVat,cardTaxAmt,cardVat}
   var cardSales = {};  // category -> {van:{buyer:amt}, pg:amt}
 
   records.forEach(function(r){
@@ -2546,11 +2584,22 @@ function aggregate(bizKey, records){
     var denom = r.va + r.card + r.cash + r.bank;
     if(!denom) return;
     var studentId = studentIdOf(r);
+    // 세금(taxAmt/vat)은 레코드 단위로 미리 반올림된 값을 그대로 써야 하므로(전체 합계를 낸 뒤 한번에
+    // 나누면 반올림 오차가 생김), 이 레코드가 걸쳐있는 카테고리별 비중을 먼저 계산해둔다.
+    var recCatAmounts = {};
+    Object.keys(r.items).forEach(function(itemName){
+      var amt = r.items[itemName]; if(!amt) return;
+      var cat = getCategory(bizKey, itemName);
+      recCatAmounts[cat] = (recCatAmounts[cat]||0) + amt;
+    });
+    var recCatKeys = Object.keys(recCatAmounts);
+    var recTotalItemAmt = recCatKeys.reduce(function(s,c){ return s+recCatAmounts[c]; }, 0);
+
     Object.keys(r.items).forEach(function(itemName){
       var amt = r.items[itemName];
       if(!amt) return;
       var cat = getCategory(bizKey, itemName);
-      catTotals[cat] = catTotals[cat] || {va:0,card:0,cash:0,bank:0,total:0};
+      catTotals[cat] = catTotals[cat] || {va:0,card:0,cash:0,bank:0,total:0,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
       PAY_METHODS.forEach(function(pm){
         var methodVal = r[pm.key];
         if(!methodVal) return;
@@ -2577,6 +2626,20 @@ function aggregate(bizKey, records){
           }
         }
       });
+    });
+    // 레코드에 미리 계산해둔 taxAmt/vat를 카테고리(및 결제채널)별 비중대로 배분해서 더한다
+    // (대부분 레코드는 카테고리 1개·채널 1개뿐이라 비중이 1이 되어 그대로 반영됨)
+    recCatKeys.forEach(function(cat){
+      var t = catTotals[cat];
+      var catPortion = recCatKeys.length===1 ? 1 : (recCatAmounts[cat]/recTotalItemAmt);
+      var recTaxAmt = (r.taxAmt||0)*catPortion, recVat = (r.vat||0)*catPortion;
+      if(r.va && !r.card){ t.vaTaxAmt += recTaxAmt; t.vaVat += recVat; }
+      else if(r.card && !r.va){ t.cardTaxAmt += recTaxAmt; t.cardVat += recVat; }
+      else if(r.va || r.card){
+        var chDenom = r.va + r.card;
+        t.vaTaxAmt += recTaxAmt*(r.va/chDenom); t.vaVat += recVat*(r.va/chDenom);
+        t.cardTaxAmt += recTaxAmt*(r.card/chDenom); t.cardVat += recVat*(r.card/chDenom);
+      }
     });
   });
   return {rows:rows, catTotals:catTotals, cardSales:cardSales};
@@ -2734,6 +2797,7 @@ function renderCombined(wrap, loaded){
   var allRefundEntries = []; // {label, name, examNo, itemName, amount}
   var allCardCancelRows = []; // 카드입금취소 건별(카드사/수수료/입금액 포함, 사업장 라벨 붙음)
   var refundCount = 0, refundSum = 0;
+  var refundGroupTaxByLabel = {}; // groupLabel -> {vaTaxAmt,vaVat,cardTaxAmt,cardVat} (레코드 단위 taxAmt/vat 그대로 합산)
 
   loaded.forEach(function(bizKey){
     var st = state.biz[bizKey];
@@ -2744,14 +2808,17 @@ function renderCombined(wrap, loaded){
     grandTotals.va += totals.va; grandTotals.card += totals.card; grandTotals.cash += totals.cash;
     grandTotals.bank += totals.bank; grandTotals.approvalAmt += totals.approvalAmt;
     if(BIZ[bizKey].taxed){
+      var bizTax = sumTax(scoped);
       q2Tax.approvalAmt += totals.approvalAmt;
+      q2Tax.taxAmt += bizTax.taxAmt; q2Tax.vat += bizTax.vat;
     }
     var agg = aggregate(bizKey, scoped);
     Object.keys(agg.catTotals).forEach(function(cat){
       var label = combinedCategoryLabel(bizKey, cat);
       var t = agg.catTotals[cat];
-      var c = combinedCat[label] = combinedCat[label] || {va:0,card:0,cash:0,bank:0,total:0,taxed:BIZ[bizKey].taxed};
+      var c = combinedCat[label] = combinedCat[label] || {va:0,card:0,cash:0,bank:0,total:0,taxed:BIZ[bizKey].taxed,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
       c.va+=t.va; c.card+=t.card; c.cash+=t.cash; c.bank+=t.bank; c.total+=t.total;
+      c.vaTaxAmt+=t.vaTaxAmt; c.vaVat+=t.vaVat; c.cardTaxAmt+=t.cardTaxAmt; c.cardVat+=t.cardVat;
     });
     Object.keys(agg.cardSales).forEach(function(cat){
       var label = combinedCategoryLabel(bizKey, cat);
@@ -2782,12 +2849,29 @@ function renderCombined(wrap, loaded){
       allRefundEntries.push({label:label, name:e.name, examNo:e.examNo, itemName:e.itemName, amount:e.amount, studentId:e.studentId, ts:e.ts, source:e.source});
       refundCount++; refundSum += e.amount;
     });
+    if(BIZ[bizKey].taxed){
+      // 환불 레코드도 통합매출장 레코드라 taxAmt/vat가 이미 건별로 계산되어 있음 -> 그대로 합산(재분할 안 함)
+      part.refunds.forEach(function(r){
+        var itemNames = Object.keys(r.items).filter(function(nm){ return r.items[nm]; });
+        var cats = {}; itemNames.forEach(function(nm){ cats[getCategory(bizKey, nm)] = 1; });
+        var catKeys = Object.keys(cats);
+        catKeys.forEach(function(cat){
+          var label = combinedCategoryLabel(bizKey, cat);
+          var glabel = groupLabel(label);
+          var portion = catKeys.length ? 1/catKeys.length : 1;
+          var e = refundGroupTaxByLabel[glabel] = refundGroupTaxByLabel[glabel] || {vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
+          var recTaxAmt = Math.abs(r.taxAmt||0)*portion, recVat = Math.abs(r.vat||0)*portion;
+          if(r.refundSource==='card_cancel'){ e.cardTaxAmt += recTaxAmt; e.cardVat += recVat; }
+          else { e.vaTaxAmt += recTaxAmt; e.vaVat += recVat; } // 은행환불은 가상계좌 원거래로 간주
+        });
+      });
+    }
     cardCancelDetailRows(bizKey, part.refunds).forEach(function(r){
       r.bizLabel = BIZ[bizKey].label;
       allCardCancelRows.push(r);
     });
   });
-  if(q2Tax.approvalAmt){ var tt=splitTax(q2Tax.approvalAmt); q2Tax.taxAmt=tt.taxAmt; q2Tax.vat=tt.vat; }
+  // q2Tax.taxAmt/vat는 이미 위 루프에서 레코드 단위로 정확히 합산됨(전체 재계산 불필요)
 
   var chipHtml = '<div class="chipRow">' +
     PAY_METHODS.map(function(pm){
@@ -2805,8 +2889,9 @@ function renderCombined(wrap, loaded){
   Object.keys(combinedCat).forEach(function(label){
     var glabel = groupLabel(label);
     var t = combinedCat[label];
-    var g = groupTotalsC[glabel] = groupTotalsC[glabel] || {va:0,card:0,cash:0,bank:0,total:0,taxed:false};
+    var g = groupTotalsC[glabel] = groupTotalsC[glabel] || {va:0,card:0,cash:0,bank:0,total:0,taxed:false,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
     g.va+=t.va; g.card+=t.card; g.cash+=t.cash; g.bank+=t.bank; g.total+=t.total;
+    g.vaTaxAmt+=t.vaTaxAmt; g.vaVat+=t.vaVat; g.cardTaxAmt+=t.cardTaxAmt; g.cardVat+=t.cardVat;
     if(t.taxed) g.taxed = true;
   });
   var catTableHtml = '<div class="card"><div class="section-title">구분별 합계(취합)<span class="badge">'+scopeLabelFor(cf)+'</span></div>'+
@@ -2818,9 +2903,8 @@ function renderCombined(wrap, loaded){
       var c = groupTotalsC[label];
       var taxCells = '<td class="num">-</td><td class="num">-</td><td class="num">-</td><td class="num">-</td>';
       if(c.taxed){
-        var vaT = splitTax(c.va), cardT = splitTax(c.card);
-        taxCells = '<td class="num">'+fmt(vaT.taxAmt)+'</td><td class="num">'+fmt(vaT.vat)+'</td>'+
-          '<td class="num">'+fmt(cardT.taxAmt)+'</td><td class="num">'+fmt(cardT.vat)+'</td>';
+        taxCells = '<td class="num">'+fmt(Math.round(c.vaTaxAmt))+'</td><td class="num">'+fmt(Math.round(c.vaVat))+'</td>'+
+          '<td class="num">'+fmt(Math.round(c.cardTaxAmt))+'</td><td class="num">'+fmt(Math.round(c.cardVat))+'</td>';
       }
       return '<tr><td style="text-align:left">'+label+'</td><td class="num">'+fmt(c.va)+'</td><td class="num">'+fmt(c.card)+'</td>'+
         '<td class="num">'+fmt(c.cash)+'</td><td class="num">'+fmt(c.bank)+'</td><td class="num">'+fmt(c.total)+'</td>'+taxCells+'</tr>';
@@ -2933,10 +3017,9 @@ function renderCombined(wrap, loaded){
         var isTaxed = label==='독서실비_퀀텀2'; // 퀀텀2만 과세
         var taxCells = '<td class="num">-</td><td class="num">-</td><td class="num">-</td><td class="num">-</td>';
         if(isTaxed){
-          var bankSum = refundGroupTotals[label] - ccSum; // 은행환불분은 가상계좌 원거래로 간주
-          var vaT = splitTax(bankSum), cardT = splitTax(ccSum);
-          taxCells = '<td class="num">'+fmt(vaT.taxAmt)+'</td><td class="num">'+fmt(vaT.vat)+'</td>'+
-            '<td class="num">'+fmt(cardT.taxAmt)+'</td><td class="num">'+fmt(cardT.vat)+'</td>';
+          var rt = refundGroupTaxByLabel[label] || {vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
+          taxCells = '<td class="num">'+fmt(Math.round(rt.vaTaxAmt))+'</td><td class="num">'+fmt(Math.round(rt.vaVat))+'</td>'+
+            '<td class="num">'+fmt(Math.round(rt.cardTaxAmt))+'</td><td class="num">'+fmt(Math.round(rt.cardVat))+'</td>';
         }
         return '<tr><td style="text-align:left">'+label+'</td><td style="text-align:left;color:var(--ink-soft)">'+esc(payerLabel)+'</td><td class="num">'+fmt(refundGroupTotals[label])+'</td>'+
           '<td style="text-align:left">'+(ccSum ? '<span class="pgtag VAN" style="background:#eef2f7;color:var(--card);">💳 '+fmt(ccSum)+'</span>' : '-')+'</td>'+taxCells+'</tr>';
@@ -3947,7 +4030,7 @@ function renderResults(){
     }).join('') +
     '<div class="chip total">승인금액 합계<b class="num">'+fmt(totals.approvalAmt)+'</b></div>';
   if(taxed){
-    var taxTot = splitTax(totals.approvalAmt);
+    var taxTot = sumTax(scoped);
     chipHtml += '<div class="chip tax">과세금액<b class="num">'+fmt(taxTot.taxAmt)+'</b></div>'+
                 '<div class="chip tax">부가세<b class="num">'+fmt(taxTot.vat)+'</b></div>';
   }
@@ -3993,7 +4076,7 @@ function renderResults(){
     groupSortLabels(Object.keys(groupTotals)).map(function(label){
       var t = groupTotals[label];
       var taxCells = '';
-      if(taxed){ var ct = splitTax(t.total); taxCells = '<td class="num">'+fmt(ct.taxAmt)+'</td><td class="num">'+fmt(ct.vat)+'</td>'; }
+      if(taxed){ taxCells = '<td class="num">'+fmt(Math.round(t.vaTaxAmt+t.cardTaxAmt))+'</td><td class="num">'+fmt(Math.round(t.vaVat+t.cardVat))+'</td>'; }
       return '<tr><td>'+label+'</td><td class="num">'+fmt(t.va)+'</td><td class="num">'+fmt(t.card)+'</td>'+
         '<td class="num">'+fmt(t.cash)+'</td><td class="num">'+fmt(t.bank)+'</td><td class="num">'+fmt(t.total)+'</td>'+taxCells+'</tr>';
     }).join('') +
@@ -4178,7 +4261,7 @@ function renderResults(){
     '</tr></thead><tbody>'+
     scoped.map(function(r){
       var itemsHtml = Object.keys(r.items).map(function(nm){ return '<span>'+esc(nm)+' '+fmt(r.items[nm])+'</span>'; }).join('');
-      var tax = taxed ? splitTax(r.approvalAmt) : null;
+      var tax = taxed ? {taxAmt:r.taxAmt, vat:r.vat} : null;
       var itemSum = Object.keys(r.items).reduce(function(s,nm){ return s+r.items[nm]; }, 0);
       var rowMismatch = Math.abs(itemSum - r.approvalAmt) > 0.5;
       return '<tr'+(rowMismatch?' style="background:var(--bad-soft)"':'')+'><td>'+r.date+'</td><td>'+esc(r.no)+'</td><td>'+esc(r.examNo)+'</td><td>'+esc(r.name)+'</td>'+
@@ -4207,7 +4290,7 @@ function renderResults(){
       '<td class="num">'+fmt(totals.va)+'</td><td class="num">'+fmt(totals.card)+'</td>'+
       '<td class="num">'+fmt(totals.cash)+'</td><td class="num">'+fmt(totals.bank)+'</td>'+
       '<td class="num">'+fmt(totals.approvalAmt)+'</td>'+
-      (taxed ? (function(){var tt=splitTax(totals.approvalAmt);return '<td class="num">'+fmt(tt.taxAmt)+'</td><td class="num">'+fmt(tt.vat)+'</td>';})() : '')+
+      (taxed ? (function(){var tt=sumTax(scoped);return '<td class="num">'+fmt(tt.taxAmt)+'</td><td class="num">'+fmt(tt.vat)+'</td>';})() : '')+
       '<td></td>'+
     '</tr></tfoot></table></div></div>';
 
@@ -4275,7 +4358,7 @@ function exportExcel(bizKey){
   scoped.forEach(function(r){
     var itemsStr = Object.keys(r.items).map(function(nm){ return nm+':'+r.items[nm]; }).join(' / ');
     var row = [r.date, r.no, r.examNo, r.name, r.va, r.card, r.cash, r.bank, r.pg, r.approvalAmt];
-    if(taxed){ var t = splitTax(r.approvalAmt); row.push(t.taxAmt, t.vat); }
+    if(taxed){ row.push(r.taxAmt, r.vat); }
     row.push(itemsStr);
     detailAoa.push(row);
   });
@@ -4327,11 +4410,10 @@ function exportTaxDetail(bizKey){
   var scoped = partitionRefunds(scopeRecords(bizKey), bizKey).sales;
   var aoa = [['결제일자','번호','수험번호','이름','승인번호','승인금액(부가세포함)','과세금액','부가세']];
   scoped.forEach(function(r){
-    var t = splitTax(r.approvalAmt);
-    aoa.push([r.date, r.no, r.examNo, r.name, r.approvalNo, r.approvalAmt, t.taxAmt, t.vat]);
+    aoa.push([r.date, r.no, r.examNo, r.name, r.approvalNo, r.approvalAmt, r.taxAmt, r.vat]);
   });
   var totalAmt = scoped.reduce(function(s,r){return s+r.approvalAmt;},0);
-  var tt = splitTax(totalAmt);
+  var tt = sumTax(scoped); // 건별로 이미 반올림된 값을 그대로 합산(전체 합계를 다시 나누지 않음)
   aoa.push(['합계','','','','', totalAmt, tt.taxAmt, tt.vat]);
   var wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), '건별과세내역');
