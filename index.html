@@ -3403,7 +3403,9 @@ function renderDepositEntryView(wrap, loaded){
     var deposit = fee!=null ? r.amount-fee : null;
     var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo);
     if(!cancelled){
-      var b = vanByBuyer[depositLabel] = vanByBuyer[depositLabel] || {tx:0, fee:0, deposit:0};
+      // 요약표는 실제 입금 묶음과 일치해야 하므로 카드매입사(O열)만으로 묶는다.
+      // (체크카드 여부는 수수료율 조회에는 쓰이지만, 입금은 같은 카드사로 한 번에 들어오므로 요약 그룹에는 안 섞는다)
+      var b = vanByBuyer[r.cardBuyer] = vanByBuyer[r.cardBuyer] || {tx:0, fee:0, deposit:0};
       b.tx += r.amount;
       if(fee!=null){ b.fee += fee; b.deposit += deposit; }
     }
@@ -3416,7 +3418,7 @@ function renderDepositEntryView(wrap, loaded){
     : (Object.keys(pgSettleDates).length>1 ? Object.keys(pgSettleDates).length+'개 일자(마감내역 기준)' : '-');
   function buyerDepositLabel(buyer){
     var dates = {};
-    vanRows.forEach(function(row){ if(row.depositLabel===buyer){ var d=byRecordDates[row.rec.id]; if(d) dates[d]=1; } });
+    vanRows.forEach(function(row){ if(row.rec.cardBuyer===buyer){ var d=byRecordDates[row.rec.id]; if(d) dates[d]=1; } });
     var keys = Object.keys(dates);
     if(!keys.length) return '<span style="color:var(--bad)">미입력</span>';
     if(keys.length===1) return keys[0];
@@ -3684,13 +3686,13 @@ function depositVoucherCardRows(bizKey, vf){
     if(cancelled) return;
     var d = byRecord[r.id];
     if(!d) return;
-    var depositLabel = vanDepositGroupLabel(r);
     var rateLabel = vanRateGroupLabel(r);
     var overrideRate = overrides[r.id];
     var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
     var fee = rate!=null ? roundDownFee(r.amount, rate) : 0;
-    var k = d+'|'+depositLabel;
-    var g = byKey[k] = byKey[k] || {date:d, label:depositLabel, tx:0, fee:0, deposit:0, breakdown:{}};
+    // 요약/전표는 실제 입금 묶음과 일치해야 하므로 카드매입사(O열)만으로 묶는다(체크카드 여부로 안 쪼갬)
+    var k = d+'|'+r.cardBuyer;
+    var g = byKey[k] = byKey[k] || {date:d, label:r.cardBuyer, tx:0, fee:0, deposit:0, breakdown:{}};
     g.tx += r.amount; g.fee += fee; g.deposit += (r.amount-fee);
     var b = g.breakdown[r.date] = g.breakdown[r.date] || {txDate:r.date, tx:0, fee:0, deposit:0};
     b.tx += r.amount; b.fee += fee; b.deposit += (r.amount-fee);
