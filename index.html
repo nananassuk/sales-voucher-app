@@ -535,9 +535,10 @@ function buildGroupTotals(catTotals){
   Object.keys(catTotals).forEach(function(cat){
     var label = groupLabel(cat);
     var t = catTotals[cat];
-    var g = groups[label] = groups[label] || {va:0,card:0,cash:0,bank:0,total:0,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
+    var g = groups[label] = groups[label] || {va:0,card:0,cash:0,bank:0,total:0,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0,cashTaxAmt:0,cashVat:0};
     g.va+=t.va; g.card+=t.card; g.cash+=t.cash; g.bank+=t.bank; g.total+=t.total;
     g.vaTaxAmt+=(t.vaTaxAmt||0); g.vaVat+=(t.vaVat||0); g.cardTaxAmt+=(t.cardTaxAmt||0); g.cardVat+=(t.cardVat||0);
+    g.cashTaxAmt+=(t.cashTaxAmt||0); g.cashVat+=(t.cashVat||0);
   });
   return groups;
 }
@@ -673,7 +674,7 @@ function cardFeeForContribution(bizKey, r, cardShare, asOfDate){
   var overrideRate = overrides[ledgerRec.id];
   var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
   if(rate==null) return {recordKey:'cardvan|'+bizKey+'|'+ledgerRec.id, fee:null};
-  return {recordKey:'cardvan|'+bizKey+'|'+ledgerRec.id, fee:Math.round(ledgerRec.amount*rate/100)}; // 예입전표와 동일: 거래 전체 금액 기준, 품목별로 쪼개지 않음
+  return {recordKey:'cardvan|'+bizKey+'|'+ledgerRec.id, fee:roundDownFee(ledgerRec.amount, rate)}; // 예입전표와 동일: 거래 전체 금액 기준, 품목별로 쪼개지 않음
 }
 /* 매출기준일: 그 날짜 "까지"의 모든 거래를 누적 합산(하루/기간 개념이 아님) */
 function deferredScopeRecords(bizKey, asOfDate){
@@ -1060,6 +1061,14 @@ function num(v){
 }
 
 /* 퀀텀2 과세 분리: 과세=ROUND(총액/1.1,0), 부가세=총액-과세 */
+/* VAN 카드 수수료는 ROUNDDOWN(금액*요율%, 0) 방식이다(Excel ROUNDDOWN과 동일하게 0쪽으로 버림).
+   부동소수점 오차로 정확히 정수가 되어야 할 값이 살짝 못 미쳐 한 단계 아래로 잘못 떨어지는 걸 막기 위해
+   0에서 먼 방향으로 아주 작은 보정값을 더한 뒤 버린다. */
+function roundDownFee(amount, rate){
+  var raw = amount*rate/100;
+  if(raw >= 0) return Math.floor(raw + 1e-6);
+  return Math.ceil(raw - 1e-6);
+}
 function splitTax(total){
   var t = Math.round(total/1.1);
   var vat = total - t;
@@ -2463,7 +2472,7 @@ function dateSummaries(bizKey){
    records는 환불이 제외된 매출 건만 들어와야 함 */
 function aggregate(bizKey, records){
   var rows = {};       // "품목명|결제수단" -> {itemName, method, category, amount, payers:{}}
-  var catTotals = {};  // category -> {va,card,cash,bank,total, vaTaxAmt,vaVat,cardTaxAmt,cardVat}
+  var catTotals = {};  // category -> {va,card,cash,bank,total, vaTaxAmt,vaVat,cardTaxAmt,cardVat,cashTaxAmt,cashVat}
   var cardSales = {};  // category -> {van:{buyer:amt}, pg:amt}
 
   records.forEach(function(r){
@@ -2487,7 +2496,7 @@ function aggregate(bizKey, records){
       var amt = r.items[itemName];
       if(!amt) return;
       var cat = getCategory(bizKey, itemName);
-      catTotals[cat] = catTotals[cat] || {va:0,card:0,cash:0,bank:0,total:0,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
+      catTotals[cat] = catTotals[cat] || {va:0,card:0,cash:0,bank:0,total:0,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0,cashTaxAmt:0,cashVat:0};
       PAY_METHODS.forEach(function(pm){
         var methodVal = r[pm.key];
         if(!methodVal) return;
@@ -2521,12 +2530,11 @@ function aggregate(bizKey, records){
       var t = catTotals[cat];
       var catPortion = recCatKeys.length===1 ? 1 : (recCatAmounts[cat]/recTotalItemAmt);
       var recTaxAmt = (r.taxAmt||0)*catPortion, recVat = (r.vat||0)*catPortion;
-      if(r.va && !r.card){ t.vaTaxAmt += recTaxAmt; t.vaVat += recVat; }
-      else if(r.card && !r.va){ t.cardTaxAmt += recTaxAmt; t.cardVat += recVat; }
-      else if(r.va || r.card){
-        var chDenom = r.va + r.card;
-        t.vaTaxAmt += recTaxAmt*(r.va/chDenom); t.vaVat += recVat*(r.va/chDenom);
-        t.cardTaxAmt += recTaxAmt*(r.card/chDenom); t.cardVat += recVat*(r.card/chDenom);
+      var chDenom = r.va + r.card + r.cash; // 매출 스코프이므로 은행(환불)은 채널 배분 대상에서 제외
+      if(chDenom>0){
+        if(r.va){ t.vaTaxAmt += recTaxAmt*(r.va/chDenom); t.vaVat += recVat*(r.va/chDenom); }
+        if(r.card){ t.cardTaxAmt += recTaxAmt*(r.card/chDenom); t.cardVat += recVat*(r.card/chDenom); }
+        if(r.cash){ t.cashTaxAmt += recTaxAmt*(r.cash/chDenom); t.cashVat += recVat*(r.cash/chDenom); }
       }
     });
   });
@@ -2592,7 +2600,7 @@ function cardCancelDetailRows(bizKey, refundRecords){
       var rateLabel = vanRateGroupLabel(ledgerRec);
       var overrideRate = overrides[ledgerRec.id];
       var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, ledgerRec.date);
-      if(rate!=null){ fee = Math.round(ledgerRec.amount*rate/100); deposit = ledgerRec.amount-fee; }
+      if(rate!=null){ fee = roundDownFee(ledgerRec.amount, rate); deposit = ledgerRec.amount-fee; }
     }
     var itemNames = Object.keys(r.items).filter(function(nm){ return r.items[nm]; });
     var amount = itemNames.reduce(function(s,nm){ return s+r.items[nm]; }, 0);
@@ -2704,9 +2712,10 @@ function renderCombined(wrap, loaded){
     Object.keys(agg.catTotals).forEach(function(cat){
       var label = combinedCategoryLabel(bizKey, cat);
       var t = agg.catTotals[cat];
-      var c = combinedCat[label] = combinedCat[label] || {va:0,card:0,cash:0,bank:0,total:0,taxed:BIZ[bizKey].taxed,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
+      var c = combinedCat[label] = combinedCat[label] || {va:0,card:0,cash:0,bank:0,total:0,taxed:BIZ[bizKey].taxed,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0,cashTaxAmt:0,cashVat:0};
       c.va+=t.va; c.card+=t.card; c.cash+=t.cash; c.bank+=t.bank; c.total+=t.total;
       c.vaTaxAmt+=t.vaTaxAmt; c.vaVat+=t.vaVat; c.cardTaxAmt+=t.cardTaxAmt; c.cardVat+=t.cardVat;
+      c.cashTaxAmt+=(t.cashTaxAmt||0); c.cashVat+=(t.cashVat||0);
     });
     Object.keys(agg.cardSales).forEach(function(cat){
       var label = combinedCategoryLabel(bizKey, cat);
@@ -2777,22 +2786,24 @@ function renderCombined(wrap, loaded){
   Object.keys(combinedCat).forEach(function(label){
     var glabel = groupLabel(label);
     var t = combinedCat[label];
-    var g = groupTotalsC[glabel] = groupTotalsC[glabel] || {va:0,card:0,cash:0,bank:0,total:0,taxed:false,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0};
+    var g = groupTotalsC[glabel] = groupTotalsC[glabel] || {va:0,card:0,cash:0,bank:0,total:0,taxed:false,vaTaxAmt:0,vaVat:0,cardTaxAmt:0,cardVat:0,cashTaxAmt:0,cashVat:0};
     g.va+=t.va; g.card+=t.card; g.cash+=t.cash; g.bank+=t.bank; g.total+=t.total;
     g.vaTaxAmt+=t.vaTaxAmt; g.vaVat+=t.vaVat; g.cardTaxAmt+=t.cardTaxAmt; g.cardVat+=t.cardVat;
+    g.cashTaxAmt+=(t.cashTaxAmt||0); g.cashVat+=(t.cashVat||0);
     if(t.taxed) g.taxed = true;
   });
   var catTableHtml = '<div class="card"><div class="section-title">구분별 합계(취합)<span class="badge">'+scopeLabelFor(cf)+'</span></div>'+
     '<div class="tableWrap"><table class="summaryTable"><thead><tr>'+
       '<th style="text-align:left">구분</th><th>가상계좌</th><th>카드</th><th>현금</th><th>은행</th><th>승인금액(합계)</th>'+
-      '<th>가상계좌 과세금액</th><th>가상계좌 부가세</th><th>카드 과세금액</th><th>카드 부가세</th>'+
+      '<th>가상계좌 과세금액</th><th>가상계좌 부가세</th><th>카드 과세금액</th><th>카드 부가세</th><th>현금 과세금액</th><th>현금 부가세</th>'+
     '</tr></thead><tbody>'+
     groupSortLabels(Object.keys(groupTotalsC)).map(function(label){
       var c = groupTotalsC[label];
-      var taxCells = '<td class="num">-</td><td class="num">-</td><td class="num">-</td><td class="num">-</td>';
+      var taxCells = '<td class="num">-</td><td class="num">-</td><td class="num">-</td><td class="num">-</td><td class="num">-</td><td class="num">-</td>';
       if(c.taxed){
         taxCells = '<td class="num">'+fmt(Math.round(c.vaTaxAmt))+'</td><td class="num">'+fmt(Math.round(c.vaVat))+'</td>'+
-          '<td class="num">'+fmt(Math.round(c.cardTaxAmt))+'</td><td class="num">'+fmt(Math.round(c.cardVat))+'</td>';
+          '<td class="num">'+fmt(Math.round(c.cardTaxAmt))+'</td><td class="num">'+fmt(Math.round(c.cardVat))+'</td>'+
+          '<td class="num">'+fmt(Math.round(c.cashTaxAmt))+'</td><td class="num">'+fmt(Math.round(c.cashVat))+'</td>';
       }
       return '<tr><td style="text-align:left">'+label+'</td><td class="num">'+fmt(c.va)+'</td><td class="num">'+fmt(c.card)+'</td>'+
         '<td class="num">'+fmt(c.cash)+'</td><td class="num">'+fmt(c.bank)+'</td><td class="num">'+fmt(c.total)+'</td>'+taxCells+'</tr>';
@@ -3388,7 +3399,7 @@ function renderDepositEntryView(wrap, loaded){
     var overrideRate = overrides[r.id];
     var defaultRate = effectiveFeeRate(bizKey, rateLabel, r.date);
     var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : defaultRate;
-    var fee = rate!=null ? Math.round(r.amount*rate/100) : null;
+    var fee = rate!=null ? roundDownFee(r.amount, rate) : null;
     var deposit = fee!=null ? r.amount-fee : null;
     var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo);
     if(!cancelled){
@@ -3436,28 +3447,43 @@ function renderDepositEntryView(wrap, loaded){
   var vanRowsById = {};
   vanRows.forEach(function(row){ vanRowsById[row.rec.id] = row; });
 
+  // 카드사(O열)별로 몇 건씩 있는지 미리 세어둠(그룹 전체선택 체크박스용)
+  var buyerCounts = {};
+  vanRows.forEach(function(row){ var b=row.rec.cardBuyer||'(미지정)'; buyerCounts[b]=(buyerCounts[b]||0)+1; });
+
   var vanDetailHtml = '<div class="tableWrap"><table class="detailTable"><thead><tr>'+
       '<th></th><th>거래일자</th><th style="text-align:left">이름</th><th style="text-align:left">카드명(N)</th><th style="text-align:left">카드매입사(O)</th><th>카드구분</th><th>승인번호</th>'+
       '<th>금액</th><th>수수료율(%)</th><th>수수료</th><th>입금액</th><th style="text-align:left">입금일자</th><th>입금취소</th>'+
     '</tr></thead><tbody>'+
-    (vanRows.length ? vanRows.map(function(row){
-      var r = row.rec;
-      var isCheck = String(r.cardType||'').trim()==='체크';
-      var depVal = byRecordDates[r.id] || '';
-      return '<tr'+(row.cancelled?' style="background:var(--bad-soft)"':'')+'>'+
-        '<td style="text-align:center"><input type="checkbox" class="vanSelectChk" data-id="'+r.id+'"></td>'+
-        '<td>'+r.date+'</td><td style="text-align:left">'+esc(r.name)+'</td>'+
-        '<td style="text-align:left">'+esc(r.cardName)+'</td><td style="text-align:left">'+esc(r.cardBuyer)+'</td>'+
-        '<td>'+(isCheck?'<span class="pgtag VAN" style="background:#fdeee0;color:#a15c1e;">체크</span>':'신용')+'</td>'+
-        '<td>'+esc(r.approvalNo)+'</td>'+
-        '<td class="num">'+fmt(r.amount)+'</td>'+
-        '<td><input type="number" step="0.01" class="vanRateInput" style="width:64px;text-align:right;'+(row.isOverride?'border-color:var(--accent);color:var(--accent);':'')+'" data-id="'+r.id+'" value="'+(row.rate!=null?row.rate:'')+'"></td>'+
-        '<td class="num">'+(row.fee!=null?fmt(row.fee):'-')+'</td>'+
-        '<td class="num">'+(row.deposit!=null?fmt(row.deposit):'-')+'</td>'+
-        '<td style="text-align:left"><input type="date" class="vanDepositRecordInput" data-id="'+r.id+'" value="'+depVal+'"></td>'+
-        '<td style="text-align:center">'+(r.amount<0 ? '<input type="checkbox" class="depositCancelChk" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" '+(row.cancelled?'checked':'')+'>' : '-')+'</td>'+
-      '</tr>';
-    }).join('') : '<tr><td colspan="13" style="text-align:center;color:var(--ink-soft)">해당 기간 VAN 건별 내역 없음</td></tr>')+
+    (vanRows.length ? (function(){
+      var html = ''; var lastBuyer = null;
+      vanRows.forEach(function(row){
+        var r = row.rec;
+        var buyer = r.cardBuyer||'(미지정)';
+        if(buyer !== lastBuyer){
+          lastBuyer = buyer;
+          html += '<tr style="background:#f6f7f9;"><td style="text-align:center">'+
+              '<input type="checkbox" class="vanBuyerSelectAll" data-buyer="'+esc(buyer)+'">'+
+            '</td><td colspan="12" style="text-align:left;font-weight:600;">'+esc(buyer)+' 전체 선택<span class="badge" style="margin-left:6px;">'+buyerCounts[buyer]+'건</span></td></tr>';
+        }
+        var isCheck = String(r.cardType||'').trim()==='체크';
+        var depVal = byRecordDates[r.id] || '';
+        html += '<tr'+(row.cancelled?' style="background:var(--bad-soft)"':'')+'>'+
+          '<td style="text-align:center"><input type="checkbox" class="vanSelectChk" data-id="'+r.id+'" data-buyer="'+esc(buyer)+'"></td>'+
+          '<td>'+r.date+'</td><td style="text-align:left">'+esc(r.name)+'</td>'+
+          '<td style="text-align:left">'+esc(r.cardName)+'</td><td style="text-align:left">'+esc(r.cardBuyer)+'</td>'+
+          '<td>'+(isCheck?'<span class="pgtag VAN" style="background:#fdeee0;color:#a15c1e;">체크</span>':'신용')+'</td>'+
+          '<td>'+esc(r.approvalNo)+'</td>'+
+          '<td class="num">'+fmt(r.amount)+'</td>'+
+          '<td><input type="number" step="0.01" class="vanRateInput" style="width:64px;text-align:right;'+(row.isOverride?'border-color:var(--accent);color:var(--accent);':'')+'" data-id="'+r.id+'" value="'+(row.rate!=null?row.rate:'')+'"></td>'+
+          '<td class="num">'+(row.fee!=null?fmt(row.fee):'-')+'</td>'+
+          '<td class="num">'+(row.deposit!=null?fmt(row.deposit):'-')+'</td>'+
+          '<td style="text-align:left"><input type="date" class="vanDepositRecordInput" data-id="'+r.id+'" value="'+depVal+'"></td>'+
+          '<td style="text-align:center">'+(r.amount<0 ? '<input type="checkbox" class="depositCancelChk" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" '+(row.cancelled?'checked':'')+'>' : '-')+'</td>'+
+        '</tr>';
+      });
+      return html;
+    })() : '<tr><td colspan="13" style="text-align:center;color:var(--ink-soft)">해당 기간 VAN 건별 내역 없음</td></tr>')+
     '</tbody></table></div>';
 
   var apMismatchHtml = apKeys.length ?
@@ -3518,6 +3544,7 @@ function renderDepositEntryView(wrap, loaded){
   if(vanSelectAll){
     vanSelectAll.addEventListener('change', function(){
       Array.prototype.forEach.call(wrap.querySelectorAll('.vanSelectChk'), function(chk){ chk.checked = vanSelectAll.checked; });
+      Array.prototype.forEach.call(wrap.querySelectorAll('.vanBuyerSelectAll'), function(g){ g.checked = vanSelectAll.checked; g.indeterminate = false; });
       updateVanCheckSummary();
     });
   }
@@ -3550,7 +3577,28 @@ function renderDepositEntryView(wrap, loaded){
       '</tbody></table></div>';
   }
   Array.prototype.forEach.call(wrap.querySelectorAll('.vanSelectChk'), function(chk){
-    chk.addEventListener('change', updateVanCheckSummary);
+    chk.addEventListener('change', function(){
+      updateVanCheckSummary();
+      syncBuyerSelectAllState(chk.getAttribute('data-buyer'));
+    });
+  });
+  function syncBuyerSelectAllState(buyer){
+    var groupChk = wrap.querySelector('.vanBuyerSelectAll[data-buyer="'+CSS.escape(buyer)+'"]');
+    if(!groupChk) return;
+    var members = Array.prototype.slice.call(wrap.querySelectorAll('.vanSelectChk[data-buyer="'+CSS.escape(buyer)+'"]'));
+    var checkedCount = members.filter(function(c){ return c.checked; }).length;
+    groupChk.checked = checkedCount>0 && checkedCount===members.length;
+    groupChk.indeterminate = checkedCount>0 && checkedCount<members.length;
+  }
+  Array.prototype.forEach.call(wrap.querySelectorAll('.vanBuyerSelectAll'), function(groupChk){
+    groupChk.addEventListener('change', function(){
+      var buyer = groupChk.getAttribute('data-buyer');
+      groupChk.indeterminate = false;
+      Array.prototype.forEach.call(wrap.querySelectorAll('.vanSelectChk[data-buyer="'+CSS.escape(buyer)+'"]'), function(chk){
+        chk.checked = groupChk.checked;
+      });
+      updateVanCheckSummary();
+    });
   });
   var vanBulkApplyBtn = document.getElementById('vanBulkApplyBtn');
   if(vanBulkApplyBtn){
@@ -3640,7 +3688,7 @@ function depositVoucherCardRows(bizKey, vf){
     var rateLabel = vanRateGroupLabel(r);
     var overrideRate = overrides[r.id];
     var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
-    var fee = rate!=null ? Math.round(r.amount*rate/100) : 0;
+    var fee = rate!=null ? roundDownFee(r.amount, rate) : 0;
     var k = d+'|'+depositLabel;
     var g = byKey[k] = byKey[k] || {date:d, label:depositLabel, tx:0, fee:0, deposit:0, breakdown:{}};
     g.tx += r.amount; g.fee += fee; g.deposit += (r.amount-fee);
@@ -3801,7 +3849,7 @@ function exportDepositVoucherDetail(loaded, vf){
       var rateLabel = vanRateGroupLabel(r);
       var overrideRate = overrides[r.id];
       var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
-      var fee = rate!=null ? Math.round(r.amount*rate/100) : 0;
+      var fee = rate!=null ? roundDownFee(r.amount, rate) : 0;
       var saleRec = state.biz[bizKey].records.filter(function(rr){ return rr.date===r.date && String(rr.approvalNo||'').trim()===r.approvalNo && rr.name===r.name; })[0];
       aoa.push([r.date, bizLabel, saleRec?saleRec.no:'', saleRec?saleRec.examNo:'', r.name, r.approvalNo, '카드(VAN)', r.cardBuyer, d, r.amount, fee, r.amount-fee]);
     });
@@ -3959,12 +4007,16 @@ function renderResults(){
   var groupTotals = buildGroupTotals(agg.catTotals);
   var catSummaryHtml = '<div class="tableWrap" style="margin-bottom:14px;"><table class="summaryTable"><thead><tr>'+
     '<th style="text-align:left">구분</th><th>가상계좌</th><th>카드</th><th>현금</th><th>은행</th><th>승인금액(합계)</th>'+
-    (taxed ? '<th>과세금액</th><th>부가세</th>' : '')+
+    (taxed ? '<th>가상계좌 과세금액</th><th>가상계좌 부가세</th><th>카드 과세금액</th><th>카드 부가세</th><th>현금 과세금액</th><th>현금 부가세</th>' : '')+
     '</tr></thead><tbody>'+
     groupSortLabels(Object.keys(groupTotals)).map(function(label){
       var t = groupTotals[label];
       var taxCells = '';
-      if(taxed){ taxCells = '<td class="num">'+fmt(Math.round(t.vaTaxAmt+t.cardTaxAmt))+'</td><td class="num">'+fmt(Math.round(t.vaVat+t.cardVat))+'</td>'; }
+      if(taxed){
+        taxCells = '<td class="num">'+fmt(Math.round(t.vaTaxAmt))+'</td><td class="num">'+fmt(Math.round(t.vaVat))+'</td>'+
+          '<td class="num">'+fmt(Math.round(t.cardTaxAmt))+'</td><td class="num">'+fmt(Math.round(t.cardVat))+'</td>'+
+          '<td class="num">'+fmt(Math.round(t.cashTaxAmt))+'</td><td class="num">'+fmt(Math.round(t.cashVat))+'</td>';
+      }
       return '<tr><td>'+label+'</td><td class="num">'+fmt(t.va)+'</td><td class="num">'+fmt(t.card)+'</td>'+
         '<td class="num">'+fmt(t.cash)+'</td><td class="num">'+fmt(t.bank)+'</td><td class="num">'+fmt(t.total)+'</td>'+taxCells+'</tr>';
     }).join('') +
