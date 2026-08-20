@@ -1010,7 +1010,7 @@ function bindDetailsToggle(root){
     el.addEventListener('toggle', function(){ state.deposit.detailsOpen[el.getAttribute('data-persist-id')] = el.open; });
   });
 }
-function fmt(n){ n = Number(n)||0; return n.toLocaleString('ko-KR'); }
+function fmt(n){ n = Number(n)||0; return Math.round(n).toLocaleString('ko-KR'); }
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
 }); }
