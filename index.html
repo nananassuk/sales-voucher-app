@@ -3560,6 +3560,7 @@ function renderDepositEntryView(wrap, loaded){
     checked.forEach(function(chk){
       var row = vanRowsById[chk.getAttribute('data-id')];
       if(!row) return;
+      if(row.cancelled) return; // 입금취소 건은 매출전표 환불내역으로 이동하므로 카드사별 입금 합계에서 제외(상단 요약표와 동일한 기준)
       var r = row.rec;
       var b = byBuyer[r.cardBuyer] = byBuyer[r.cardBuyer] || {count:0, amount:0, fee:0, deposit:0};
       b.count++; b.amount += r.amount; b.fee += (row.fee||0); b.deposit += (row.deposit!=null?row.deposit:r.amount);
