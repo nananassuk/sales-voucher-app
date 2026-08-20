@@ -1484,10 +1484,59 @@ function loadDepositCancelFlags(bizKey){
 function saveDepositCancelFlags(bizKey){
   return storageAdapter.set('depositCancelFlags:'+bizKey, JSON.stringify(state.biz[bizKey].depositCancelFlags)).catch(function(){});
 }
-/* 통합매출장 카드 마이너스 건이 "입금취소"로 표시됐는지: date+승인번호 기준 */
+/* 통합매출장 카드 마이너스 건이 "입금취소"로 표시됐는지: date+승인번호 기준.
+   저장값이 true면 전액취소, 숫자(양수)면 그 금액만큼만 부분취소(나머지는 그냥 상계로 남음). */
 function isDepositCancel(bizKey, date, approvalNo){
   var flags = state.biz[bizKey].depositCancelFlags || {};
-  return !!flags[date+'|'+String(approvalNo||'').trim()];
+  return flags[date+'|'+String(approvalNo||'').trim()] === true;
+}
+function depositCancelPartialAmount(bizKey, date, approvalNo){
+  var flags = state.biz[bizKey].depositCancelFlags || {};
+  var v = flags[date+'|'+String(approvalNo||'').trim()];
+  if(v==null || v===true || v===false) return null;
+  var n = Number(v);
+  return (!isNaN(n) && n>0) ? n : null;
+}
+function scaleItemAmounts(items, ratio){
+  var out = {};
+  Object.keys(items).forEach(function(k){ out[k] = items[k]*ratio; });
+  return out;
+}
+/* 부분 입금취소로 표시된 건은 원본 레코드 하나를 "입금취소분"과 "상계로 남는 나머지분" 둘로 나눠서
+   이후 모든 화면(스코프 필터링·매출/환불 분리 등)에서 각자 정상적으로 처리되게 한다. */
+function expandPartialCardCancellations(bizKey, records){
+  var flags = state.biz[bizKey].depositCancelFlags || {};
+  var out = [];
+  records.forEach(function(r){
+    if(r.card < 0){
+      var key = r.date+'|'+String(r.approvalNo||'').trim();
+      var flagVal = flags[key];
+      if(flagVal!=null && flagVal!==true && flagVal!==false){
+        var partialAmt = Number(flagVal);
+        if(!isNaN(partialAmt) && partialAmt>0 && partialAmt<Math.abs(r.card)){
+          var cancelRatio = partialAmt/Math.abs(r.card);
+          var cancelPortion = Object.assign({}, r, {
+            id: r.id+'_cancelpart',
+            card: -partialAmt,
+            items: scaleItemAmounts(r.items, cancelRatio),
+            approvalAmt: r.approvalAmt*cancelRatio,
+            transactionDate: r.date, // 카드매출장 매칭(수수료 등)은 원래 거래일자 기준으로 해야 하므로 보존
+            __forcedCardCancel: true
+          });
+          var remainder = Object.assign({}, r, {
+            id: r.id+'_remainder',
+            card: r.card+partialAmt, // 덜 마이너스로(나머지는 그냥 정상 상계 카드취소로 남음)
+            items: scaleItemAmounts(r.items, 1-cancelRatio),
+            approvalAmt: r.approvalAmt*(1-cancelRatio)
+          });
+          out.push(cancelPortion, remainder);
+          return;
+        }
+      }
+    }
+    out.push(r);
+  });
+  return out;
 }
 
 /* ---------------------------------------------------------------
@@ -2348,7 +2397,8 @@ function tagAcademicYear(records){
 }
 function bizRecordsForYear(bizKey){
   var year = state.academicYear;
-  return (state.biz[bizKey].records||[]).filter(function(r){ return !r.academicYear || r.academicYear===year; });
+  var recs = (state.biz[bizKey].records||[]).filter(function(r){ return !r.academicYear || r.academicYear===year; });
+  return expandPartialCardCancellations(bizKey, recs);
 }
 function loadAcademicYear(){
   return storageAdapter.get('academicYear').then(function(r){
@@ -2362,6 +2412,9 @@ function filterByScope(records, f, bizKey){
   // 카드 입금취소로 표시된 건은 거래일자(승인일자)가 아니라 입금일자 기준으로 걸러야 하므로,
   // 그런 건은 입금일자를 기준일로 삼아 비교한다(입금일자가 아직 없으면 원래 거래일자로 대체).
   function effectiveDate(r){
+    if(r.__forcedCardCancel){
+      return cardCancelDepositDate(bizKey, {approvalNo:r.approvalNo, date:r.transactionDate}) || r.transactionDate;
+    }
     if(bizKey && r.card < 0 && isDepositCancel(bizKey, r.date, r.approvalNo)){
       return cardCancelDepositDate(bizKey, r) || r.date;
     }
@@ -2411,6 +2464,14 @@ function partitionRefunds(records, bizKey){
     // 환불(계좌 취소)은 은행 항목 마이너스만 해당. 카드 마이너스는 원래 카드 취소(넷팅)일 뿐 매출로 합산되지만,
     // "입금취소"로 직접 표시한 건은 상계할 대상이 없는 실제 환불이므로 여기서 제외해 환불로 이동시킴.
     if(r.bank < 0){ r.refundSource = 'bank'; refunds.push(r); return; }
+    if(r.__forcedCardCancel){
+      // 부분 입금취소로 미리 분리해둔 조각: 무조건 환불로(입금일자 기준), 원래 거래일자는 transactionDate에 보존됨
+      var pcDepDate = cardCancelDepositDate(bizKey, {approvalNo:r.approvalNo, date:r.transactionDate});
+      var pcRefundRec = Object.assign({}, r, {date: pcDepDate || r.transactionDate});
+      pcRefundRec.refundSource = 'card_cancel';
+      refunds.push(pcRefundRec);
+      return;
+    }
     if(r.card < 0 && bizKey && isDepositCancel(bizKey, r.date, r.approvalNo)){
       // 카드 입금취소는 거래일자(승인일자)가 아니라 입금일자 기준으로 인식되어야 하므로,
       // 예입전표에서 입력한 그 건의 입금일자를 찾아 환불 레코드의 날짜로 사용한다(원본 레코드는 그대로 둠).
@@ -3405,15 +3466,20 @@ function renderDepositEntryView(wrap, loaded){
     var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : defaultRate;
     var fee = rate!=null ? roundDownFee(r.amount, rate) : null;
     var deposit = fee!=null ? r.amount-fee : null;
-    var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo);
+    var partialAmt = depositCancelPartialAmount(bizKey, r.date, r.approvalNo);
+    var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo); // 전액취소만 true(부분취소는 별도 처리)
     if(!cancelled){
       // 요약표는 실제 입금 묶음과 일치해야 하므로 카드매입사(O열)만으로 묶는다.
       // (체크카드 여부는 수수료율 조회에는 쓰이지만, 입금은 같은 카드사로 한 번에 들어오므로 요약 그룹에는 안 섞는다)
+      // 부분취소가 있으면 취소분을 뺀 나머지 금액만 실제 입금 요약에 반영한다(취소분은 매출전표 환불로 따로 감).
+      var summaryAmt = partialAmt!=null ? (r.amount + partialAmt) : r.amount;
+      var summaryFee = (rate!=null) ? roundDownFee(summaryAmt, rate) : null;
+      var summaryDeposit = summaryFee!=null ? summaryAmt-summaryFee : null;
       var b = vanByBuyer[r.cardBuyer] = vanByBuyer[r.cardBuyer] || {tx:0, fee:0, deposit:0};
-      b.tx += r.amount;
-      if(fee!=null){ b.fee += fee; b.deposit += deposit; }
+      b.tx += summaryAmt;
+      if(summaryFee!=null){ b.fee += summaryFee; b.deposit += summaryDeposit; }
     }
-    return {rec:r, rateLabel:rateLabel, depositLabel:depositLabel, rate:rate, isOverride: overrideRate!=null && overrideRate!=='', fee:fee, deposit:deposit, cancelled:cancelled};
+    return {rec:r, rateLabel:rateLabel, depositLabel:depositLabel, rate:rate, isOverride: overrideRate!=null && overrideRate!=='', fee:fee, deposit:deposit, cancelled:cancelled, partialAmt:partialAmt};
   });
 
   var byRecordDates = state.biz[bizKey].vanDepositByRecord || {};
@@ -3460,7 +3526,7 @@ function renderDepositEntryView(wrap, loaded){
 
   var vanDetailHtml = '<div class="tableWrap"><table class="detailTable"><thead><tr>'+
       '<th></th><th>거래일자</th><th style="text-align:left">이름</th><th style="text-align:left">카드명(N)</th><th style="text-align:left">카드매입사(O)</th><th>카드구분</th><th>승인번호</th>'+
-      '<th>금액</th><th>수수료율(%)</th><th>수수료</th><th>입금액</th><th style="text-align:left">입금일자</th><th>입금취소</th>'+
+      '<th>금액</th><th>수수료율(%)</th><th>수수료</th><th>입금액</th><th style="text-align:left">입금일자</th><th>입금취소<br><span style="font-weight:400;font-size:10px;color:var(--ink-soft);">(금액칸 비우면 전액)</span></th>'+
     '</tr></thead><tbody>'+
     (vanRows.length ? (function(){
       var html = ''; var lastBuyer = null;
@@ -3475,7 +3541,7 @@ function renderDepositEntryView(wrap, loaded){
         }
         var isCheck = String(r.cardType||'').trim()==='체크';
         var depVal = byRecordDates[r.id] || '';
-        html += '<tr'+(row.cancelled?' style="background:var(--bad-soft)"':'')+'>'+
+        html += '<tr'+((row.cancelled||row.partialAmt)?' style="background:var(--bad-soft)"':'')+'>'+
           '<td style="text-align:center"><input type="checkbox" class="vanSelectChk" data-idx="'+idx+'" data-buyer="'+esc(buyer)+'"></td>'+
           '<td>'+r.date+'</td><td style="text-align:left">'+esc(r.name)+'</td>'+
           '<td style="text-align:left">'+esc(r.cardName)+'</td><td style="text-align:left">'+esc(r.cardBuyer)+'</td>'+
@@ -3486,7 +3552,11 @@ function renderDepositEntryView(wrap, loaded){
           '<td class="num">'+(row.fee!=null?fmt(row.fee):'-')+'</td>'+
           '<td class="num">'+(row.deposit!=null?fmt(row.deposit):'-')+'</td>'+
           '<td style="text-align:left"><input type="date" class="vanDepositRecordInput" data-id="'+r.id+'" value="'+depVal+'"></td>'+
-          '<td style="text-align:center">'+(r.amount<0 ? '<input type="checkbox" class="depositCancelChk" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" '+(row.cancelled?'checked':'')+'>' : '-')+'</td>'+
+          '<td style="text-align:center">'+(r.amount<0 ?
+            '<label style="display:flex;align-items:center;gap:4px;justify-content:center;white-space:nowrap;">'+
+              '<input type="checkbox" class="depositCancelChk" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" '+((row.cancelled||row.partialAmt)?'checked':'')+'>'+
+              '<input type="number" class="depositCancelPartialInput" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" placeholder="전액" title="비워두면 전액 입금취소, 금액을 넣으면 그 금액만큼만 입금취소되고 나머지는 상계로 남음" style="width:80px;text-align:right;'+(row.partialAmt?'border-color:var(--accent);color:var(--accent);':'')+'" value="'+(row.partialAmt?Math.abs(row.partialAmt):'')+'">'+
+            '</label>' : '-')+'</td>'+
         '</tr>';
       });
       return html;
@@ -3636,16 +3706,35 @@ function renderDepositEntryView(wrap, loaded){
       saveVanFeeOverrides(bizKey).then(function(){ renderDepositPage(); });
     });
   });
+  function applyCancelFlag(dateVal, apnoVal, checked, partialVal){
+    var key = dateVal+'|'+apnoVal;
+    state.biz[bizKey].depositCancelFlags = state.biz[bizKey].depositCancelFlags || {};
+    if(!checked){
+      delete state.biz[bizKey].depositCancelFlags[key];
+    } else {
+      var n = Number(partialVal);
+      state.biz[bizKey].depositCancelFlags[key] = (partialVal && !isNaN(n) && n>0) ? n : true;
+    }
+    saveDepositCancelFlags(bizKey).then(function(){
+      var msg = !checked ? '입금취소 표시를 해제했습니다'
+        : (partialVal ? '부분 입금취소(' + fmt(Number(partialVal)) + '원)로 표시했습니다, 나머지는 상계로 남습니다'
+        : '전액 입금취소로 표시했습니다(매출전표 환불내역으로 이동)');
+      toast(msg);
+      renderDepositPage();
+    });
+  }
   Array.prototype.forEach.call(wrap.querySelectorAll('.depositCancelChk'), function(chk){
     chk.addEventListener('change', function(){
-      var key = chk.getAttribute('data-date')+'|'+chk.getAttribute('data-apno');
-      state.biz[bizKey].depositCancelFlags = state.biz[bizKey].depositCancelFlags || {};
-      if(chk.checked) state.biz[bizKey].depositCancelFlags[key] = true;
-      else delete state.biz[bizKey].depositCancelFlags[key];
-      saveDepositCancelFlags(bizKey).then(function(){
-        toast(chk.checked ? '입금취소로 표시했습니다(매출전표 환불내역으로 이동)' : '입금취소 표시를 해제했습니다');
-        renderDepositPage();
-      });
+      var sibling = chk.parentElement.querySelector('.depositCancelPartialInput');
+      applyCancelFlag(chk.getAttribute('data-date'), chk.getAttribute('data-apno'), chk.checked, sibling?sibling.value.trim():'');
+    });
+  });
+  Array.prototype.forEach.call(wrap.querySelectorAll('.depositCancelPartialInput'), function(inp){
+    inp.addEventListener('change', function(){
+      var sibling = inp.parentElement.querySelector('.depositCancelChk');
+      var hasValue = inp.value.trim()!=='';
+      if(hasValue && sibling) sibling.checked = true; // 금액을 입력하면 자동으로 체크됨
+      applyCancelFlag(inp.getAttribute('data-date'), inp.getAttribute('data-apno'), sibling?sibling.checked:hasValue, inp.value.trim());
     });
   });
   bindDetailsToggle(wrap);
@@ -3690,18 +3779,20 @@ function depositVoucherCardRows(bizKey, vf){
   vanRecs.forEach(function(r){
     var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo);
     if(cancelled) return;
+    var partialAmt = depositCancelPartialAmount(bizKey, r.date, r.approvalNo);
+    var effAmt = partialAmt!=null ? (r.amount+partialAmt) : r.amount; // 부분취소면 남은 금액만 정상 입금으로 반영
     var d = byRecord[r.id];
     if(!d) return;
     var rateLabel = vanRateGroupLabel(r);
     var overrideRate = overrides[r.id];
     var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
-    var fee = rate!=null ? roundDownFee(r.amount, rate) : 0;
+    var fee = rate!=null ? roundDownFee(effAmt, rate) : 0;
     // 요약/전표는 실제 입금 묶음과 일치해야 하므로 카드매입사(O열)만으로 묶는다(체크카드 여부로 안 쪼갬)
     var k = d+'|'+r.cardBuyer;
     var g = byKey[k] = byKey[k] || {date:d, label:r.cardBuyer, tx:0, fee:0, deposit:0, breakdown:{}};
-    g.tx += r.amount; g.fee += fee; g.deposit += (r.amount-fee);
+    g.tx += effAmt; g.fee += fee; g.deposit += (effAmt-fee);
     var b = g.breakdown[r.date] = g.breakdown[r.date] || {txDate:r.date, tx:0, fee:0, deposit:0};
-    b.tx += r.amount; b.fee += fee; b.deposit += (r.amount-fee);
+    b.tx += effAmt; b.fee += fee; b.deposit += (effAmt-fee);
   });
   var cardScoped = depositScopeRecords(state.deposit.card, bizKey, {mode:vf.mode, day:vf.day, start:vf.start, end:vf.end, basis:'deposit'});
   var apGroups = {};
@@ -3853,13 +3944,15 @@ function exportDepositVoucherDetail(loaded, vf){
     vanRecs.forEach(function(r){
       var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo);
       if(cancelled) return;
+      var partialAmt = depositCancelPartialAmount(bizKey, r.date, r.approvalNo);
+      var effAmt = partialAmt!=null ? (r.amount+partialAmt) : r.amount;
       var d = byRecord[r.id]; if(!d) return;
       var rateLabel = vanRateGroupLabel(r);
       var overrideRate = overrides[r.id];
       var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
-      var fee = rate!=null ? roundDownFee(r.amount, rate) : 0;
+      var fee = rate!=null ? roundDownFee(effAmt, rate) : 0;
       var saleRec = state.biz[bizKey].records.filter(function(rr){ return rr.date===r.date && String(rr.approvalNo||'').trim()===r.approvalNo && rr.name===r.name; })[0];
-      aoa.push([r.date, bizLabel, saleRec?saleRec.no:'', saleRec?saleRec.examNo:'', r.name, r.approvalNo, '카드(VAN)', r.cardBuyer, d, r.amount, fee, r.amount-fee]);
+      aoa.push([r.date, bizLabel, saleRec?saleRec.no:'', saleRec?saleRec.examNo:'', r.name, r.approvalNo, '카드(VAN)', r.cardBuyer, d, effAmt, fee, effAmt-fee]);
     });
     // 신용카드(PG)
     var cardScoped = depositScopeRecords(state.deposit.card, bizKey, {mode:vf.mode, day:vf.day, start:vf.start, end:vf.end, basis:'deposit'});
