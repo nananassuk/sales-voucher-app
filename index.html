@@ -1502,6 +1502,18 @@ function scaleItemAmounts(items, ratio){
   Object.keys(items).forEach(function(k){ out[k] = items[k]*ratio; });
   return out;
 }
+/* 카드 건별 마이너스(취소) 레코드에서, 사용자가 "부분 입금취소"로 입력한 값(입금액=순액 기준)을
+   거래금액(gross) 기준 잔여치로 환산한다. 예입전표 요약/전표작성/엑셀 등 거래금액 기준 화면에서 공용으로 씀. */
+function remainingGrossAfterPartialCancel(amount, rate, partialNetAmt){
+  if(partialNetAmt==null) return amount;
+  var fee = rate!=null ? roundDownFee(amount, rate) : 0;
+  var depositTotal = Math.abs(amount-fee);
+  var grossTotal = Math.abs(amount);
+  if(!depositTotal) return amount;
+  var ratio = partialNetAmt/depositTotal;
+  var grossCancelled = grossTotal*ratio;
+  return amount + grossCancelled; // amount는 음수라 grossCancelled(양수)만큼 더하면 덜 마이너스가 됨
+}
 /* 부분 입금취소로 표시된 건은 원본 레코드 하나를 "입금취소분"과 "상계로 남는 나머지분" 둘로 나눠서
    이후 모든 화면(스코프 필터링·매출/환불 분리 등)에서 각자 정상적으로 처리되게 한다. */
 function expandPartialCardCancellations(bizKey, records){
@@ -1512,22 +1524,27 @@ function expandPartialCardCancellations(bizKey, records){
       var key = r.date+'|'+String(r.approvalNo||'').trim();
       var flagVal = flags[key];
       if(flagVal!=null && flagVal!==true && flagVal!==false){
-        var partialAmt = Number(flagVal);
-        if(!isNaN(partialAmt) && partialAmt>0 && partialAmt<Math.abs(r.card)){
-          var cancelRatio = partialAmt/Math.abs(r.card);
+        var partialNetAmt = Number(flagVal); // 사용자가 입력한 값은 "입금액" 기준(수수료 뺀 순액)
+        var grossTotal = Math.abs(r.card);
+        var feeInfo = vanFeeForSalesRecord(bizKey, r);
+        var depositTotal = feeInfo ? Math.abs(feeInfo.deposit) : grossTotal; // 수수료율을 못 찾으면 순액=거래금액으로 대체
+        if(!isNaN(partialNetAmt) && partialNetAmt>0 && partialNetAmt<depositTotal){
+          // 입금액 기준 비율(=거래금액 기준 비율과 동일: 수수료가 선형이므로)로 거래금액/품목도 같이 나눈다
+          var ratio = partialNetAmt/depositTotal;
+          var grossCancelled = grossTotal*ratio;
           var cancelPortion = Object.assign({}, r, {
             id: r.id+'_cancelpart',
-            card: -partialAmt,
-            items: scaleItemAmounts(r.items, cancelRatio),
-            approvalAmt: r.approvalAmt*cancelRatio,
+            card: -partialNetAmt, // 매출전표 환불에는 거래금액이 아니라 입금액(순액)이 그대로 반영되어야 함
+            items: scaleItemAmounts(r.items, partialNetAmt/grossTotal), // 품목값도 입금액 기준 비중으로 축소해서 환불액이 입금액과 일치하게 함
+            approvalAmt: -partialNetAmt,
             transactionDate: r.date, // 카드매출장 매칭(수수료 등)은 원래 거래일자 기준으로 해야 하므로 보존
             __forcedCardCancel: true
           });
           var remainder = Object.assign({}, r, {
             id: r.id+'_remainder',
-            card: r.card+partialAmt, // 덜 마이너스로(나머지는 그냥 정상 상계 카드취소로 남음)
-            items: scaleItemAmounts(r.items, 1-cancelRatio),
-            approvalAmt: r.approvalAmt*(1-cancelRatio)
+            card: r.card+grossCancelled, // 나머지는 거래금액 기준 그대로 남아서 정상적으로 수수료가 다시 계산됨
+            items: scaleItemAmounts(r.items, 1-ratio),
+            approvalAmt: r.approvalAmt*(1-ratio)
           });
           out.push(cancelPortion, remainder);
           return;
@@ -2476,8 +2493,17 @@ function partitionRefunds(records, bizKey){
       // 카드 입금취소는 거래일자(승인일자)가 아니라 입금일자 기준으로 인식되어야 하므로,
       // 예입전표에서 입력한 그 건의 입금일자를 찾아 환불 레코드의 날짜로 사용한다(원본 레코드는 그대로 둠).
       // 단, 카드매출장 매칭(수수료 계산)은 원래 거래일자로 해야 하므로 transactionDate에 따로 보존해둔다.
+      // 환불액은 거래금액이 아니라 입금액(수수료 뺀 순액) 기준으로 반영한다(실제로 입금 안 된 만큼만 환불이므로).
       var depDate = cardCancelDepositDate(bizKey, r);
-      var refundRec = depDate ? Object.assign({}, r, {date: depDate, transactionDate: r.date}) : Object.assign({}, r, {transactionDate: r.date});
+      var feeInfo = vanFeeForSalesRecord(bizKey, r);
+      var netRatio = feeInfo ? Math.abs(feeInfo.deposit)/Math.abs(r.card) : 1; // 수수료율을 못 찾으면 그대로(거래금액=입금액으로 간주)
+      var refundRec = Object.assign({}, r, {
+        date: depDate || r.date,
+        transactionDate: r.date,
+        card: feeInfo ? feeInfo.deposit : r.card,
+        items: scaleItemAmounts(r.items, netRatio),
+        approvalAmt: feeInfo ? feeInfo.deposit : r.approvalAmt
+      });
       refundRec.refundSource = 'card_cancel';
       refunds.push(refundRec);
       return;
@@ -2493,6 +2519,21 @@ function cardCancelDepositDate(bizKey, r){
   if(!ledgerRec) return null;
   var byRec = state.biz[bizKey].vanDepositByRecord || {};
   return byRec[ledgerRec.id] || null;
+}
+/* 통합매출장 판매 레코드(카드 마이너스 건 등)의 실제 수수료/입금액을 카드매출장 매칭으로 구한다.
+   입금취소는 "거래금액"이 아니라 "입금액"(수수료 뺀 순액) 기준으로 처리해야 하므로 필요함. */
+function vanFeeForSalesRecord(bizKey, r){
+  var ledgerRec = (state.biz[bizKey].cardLedgerRecords||[]).filter(function(lr){
+    return lr.approvalNo===String(r.approvalNo||'').trim() && lr.date===(r.transactionDate||r.date);
+  })[0];
+  if(!ledgerRec) return null;
+  var rateLabel = vanRateGroupLabel(ledgerRec);
+  var overrides = state.biz[bizKey].vanFeeOverrides || {};
+  var overrideRate = overrides[ledgerRec.id];
+  var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, ledgerRec.date);
+  if(rate==null) return null;
+  var fee = roundDownFee(r.card, rate);
+  return {fee:fee, deposit:r.card-fee};
 }
 function scopeLabelFor(f){
   if(f.mode==='all') return '전체기간';
@@ -3472,7 +3513,7 @@ function renderDepositEntryView(wrap, loaded){
       // 요약표는 실제 입금 묶음과 일치해야 하므로 카드매입사(O열)만으로 묶는다.
       // (체크카드 여부는 수수료율 조회에는 쓰이지만, 입금은 같은 카드사로 한 번에 들어오므로 요약 그룹에는 안 섞는다)
       // 부분취소가 있으면 취소분을 뺀 나머지 금액만 실제 입금 요약에 반영한다(취소분은 매출전표 환불로 따로 감).
-      var summaryAmt = partialAmt!=null ? (r.amount + partialAmt) : r.amount;
+      var summaryAmt = remainingGrossAfterPartialCancel(r.amount, rate, partialAmt);
       var summaryFee = (rate!=null) ? roundDownFee(summaryAmt, rate) : null;
       var summaryDeposit = summaryFee!=null ? summaryAmt-summaryFee : null;
       var b = vanByBuyer[r.cardBuyer] = vanByBuyer[r.cardBuyer] || {tx:0, fee:0, deposit:0};
@@ -3526,7 +3567,7 @@ function renderDepositEntryView(wrap, loaded){
 
   var vanDetailHtml = '<div class="tableWrap"><table class="detailTable"><thead><tr>'+
       '<th></th><th>거래일자</th><th style="text-align:left">이름</th><th style="text-align:left">카드명(N)</th><th style="text-align:left">카드매입사(O)</th><th>카드구분</th><th>승인번호</th>'+
-      '<th>금액</th><th>수수료율(%)</th><th>수수료</th><th>입금액</th><th style="text-align:left">입금일자</th><th>입금취소<br><span style="font-weight:400;font-size:10px;color:var(--ink-soft);">(금액칸 비우면 전액)</span></th>'+
+      '<th>금액</th><th>수수료율(%)</th><th>수수료</th><th>입금액</th><th style="text-align:left">입금일자</th><th>입금취소<br><span style="font-weight:400;font-size:10px;color:var(--ink-soft);">(입금액 기준, 비우면 전액)</span></th>'+
     '</tr></thead><tbody>'+
     (vanRows.length ? (function(){
       var html = ''; var lastBuyer = null;
@@ -3555,7 +3596,7 @@ function renderDepositEntryView(wrap, loaded){
           '<td style="text-align:center">'+(r.amount<0 ?
             '<label style="display:flex;align-items:center;gap:4px;justify-content:center;white-space:nowrap;">'+
               '<input type="checkbox" class="depositCancelChk" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" '+((row.cancelled||row.partialAmt)?'checked':'')+'>'+
-              '<input type="number" class="depositCancelPartialInput" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" placeholder="전액" title="비워두면 전액 입금취소, 금액을 넣으면 그 금액만큼만 입금취소되고 나머지는 상계로 남음" style="width:80px;text-align:right;'+(row.partialAmt?'border-color:var(--accent);color:var(--accent);':'')+'" value="'+(row.partialAmt?Math.abs(row.partialAmt):'')+'">'+
+              '<input type="number" class="depositCancelPartialInput" data-date="'+r.date+'" data-apno="'+esc(r.approvalNo)+'" placeholder="전액" title="비워두면 전액 입금취소, 금액을 넣으면 그 입금액(수수료 뺀 순액) 만큼만 입금취소되고 나머지는 상계로 남음" style="width:80px;text-align:right;'+(row.partialAmt?'border-color:var(--accent);color:var(--accent);':'')+'" value="'+(row.partialAmt?Math.abs(row.partialAmt):'')+'">'+
             '</label>' : '-')+'</td>'+
         '</tr>';
       });
@@ -3780,12 +3821,12 @@ function depositVoucherCardRows(bizKey, vf){
     var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo);
     if(cancelled) return;
     var partialAmt = depositCancelPartialAmount(bizKey, r.date, r.approvalNo);
-    var effAmt = partialAmt!=null ? (r.amount+partialAmt) : r.amount; // 부분취소면 남은 금액만 정상 입금으로 반영
     var d = byRecord[r.id];
     if(!d) return;
     var rateLabel = vanRateGroupLabel(r);
     var overrideRate = overrides[r.id];
     var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
+    var effAmt = remainingGrossAfterPartialCancel(r.amount, rate, partialAmt); // 부분취소면 남은 금액만 정상 입금으로 반영
     var fee = rate!=null ? roundDownFee(effAmt, rate) : 0;
     // 요약/전표는 실제 입금 묶음과 일치해야 하므로 카드매입사(O열)만으로 묶는다(체크카드 여부로 안 쪼갬)
     var k = d+'|'+r.cardBuyer;
@@ -3945,11 +3986,11 @@ function exportDepositVoucherDetail(loaded, vf){
       var cancelled = r.amount<0 && isDepositCancel(bizKey, r.date, r.approvalNo);
       if(cancelled) return;
       var partialAmt = depositCancelPartialAmount(bizKey, r.date, r.approvalNo);
-      var effAmt = partialAmt!=null ? (r.amount+partialAmt) : r.amount;
       var d = byRecord[r.id]; if(!d) return;
       var rateLabel = vanRateGroupLabel(r);
       var overrideRate = overrides[r.id];
       var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
+      var effAmt = remainingGrossAfterPartialCancel(r.amount, rate, partialAmt);
       var fee = rate!=null ? roundDownFee(effAmt, rate) : 0;
       var saleRec = state.biz[bizKey].records.filter(function(rr){ return rr.date===r.date && String(rr.approvalNo||'').trim()===r.approvalNo && rr.name===r.name; })[0];
       aoa.push([r.date, bizLabel, saleRec?saleRec.no:'', saleRec?saleRec.examNo:'', r.name, r.approvalNo, '카드(VAN)', r.cardBuyer, d, effAmt, fee, effAmt-fee]);
