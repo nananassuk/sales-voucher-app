@@ -3450,8 +3450,9 @@ function renderDepositEntryView(wrap, loaded){
   '</div>'+
   '<div id="vanCheckSummary-'+bizKey+'" style="margin-bottom:10px;"></div>' : '';
 
-  var vanRowsById = {};
-  vanRows.forEach(function(row){ vanRowsById[row.rec.id] = row; });
+  // 체크박스 선택 합계는 내용 기반 id 대신 배열 순번(idx)으로 조회한다 — 카드매출장에 완전히 동일한
+  // 날짜+승인번호+번호+이름 조합이 두 번 이상 나오는 경우에도 절대 충돌하지 않도록 하기 위함
+  // (수수료율/입금일자/입금취소는 저장이 필요해서 계속 r.id를 쓰지만, 이 체크박스 합계는 화면표시 전용이라 idx로 충분)
 
   // 카드사(O열)별로 몇 건씩 있는지 미리 세어둠(그룹 전체선택 체크박스용)
   var buyerCounts = {};
@@ -3463,7 +3464,7 @@ function renderDepositEntryView(wrap, loaded){
     '</tr></thead><tbody>'+
     (vanRows.length ? (function(){
       var html = ''; var lastBuyer = null;
-      vanRows.forEach(function(row){
+      vanRows.forEach(function(row, idx){
         var r = row.rec;
         var buyer = r.cardBuyer||'(미지정)';
         if(buyer !== lastBuyer){
@@ -3475,7 +3476,7 @@ function renderDepositEntryView(wrap, loaded){
         var isCheck = String(r.cardType||'').trim()==='체크';
         var depVal = byRecordDates[r.id] || '';
         html += '<tr'+(row.cancelled?' style="background:var(--bad-soft)"':'')+'>'+
-          '<td style="text-align:center"><input type="checkbox" class="vanSelectChk" data-id="'+r.id+'" data-buyer="'+esc(buyer)+'"></td>'+
+          '<td style="text-align:center"><input type="checkbox" class="vanSelectChk" data-idx="'+idx+'" data-buyer="'+esc(buyer)+'"></td>'+
           '<td>'+r.date+'</td><td style="text-align:left">'+esc(r.name)+'</td>'+
           '<td style="text-align:left">'+esc(r.cardName)+'</td><td style="text-align:left">'+esc(r.cardBuyer)+'</td>'+
           '<td>'+(isCheck?'<span class="pgtag VAN" style="background:#fdeee0;color:#a15c1e;">체크</span>':'신용')+'</td>'+
@@ -3562,7 +3563,7 @@ function renderDepositEntryView(wrap, loaded){
     var byBuyer = {}; // cardBuyer -> {count, amount, fee, deposit}
     var grandCount=0, grandAmount=0, grandFee=0, grandDeposit=0;
     checked.forEach(function(chk){
-      var row = vanRowsById[chk.getAttribute('data-id')];
+      var row = vanRows[Number(chk.getAttribute('data-idx'))];
       if(!row) return;
       if(row.cancelled) return; // 입금취소 건은 매출전표 환불내역으로 이동하므로 카드사별 입금 합계에서 제외(상단 요약표와 동일한 기준)
       var r = row.rec;
@@ -3614,7 +3615,7 @@ function renderDepositEntryView(wrap, loaded){
       var checked = Array.prototype.filter.call(wrap.querySelectorAll('.vanSelectChk'), function(c){ return c.checked; });
       if(!dateVal){ toast('적용할 입금일자를 먼저 선택해주세요.'); return; }
       if(!checked.length){ toast('선택된 건이 없습니다.'); return; }
-      checked.forEach(function(chk){ byRecordDatesRef[chk.getAttribute('data-id')] = dateVal; });
+      checked.forEach(function(chk){ var rr=vanRows[Number(chk.getAttribute('data-idx'))]; if(rr) byRecordDatesRef[rr.rec.id] = dateVal; });
       saveVanDepositByRecord(bizKey).then(function(){
         toast(checked.length+'건에 입금일자 '+dateVal+' 일괄 적용했습니다');
         renderDepositPage();
