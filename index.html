@@ -1339,6 +1339,7 @@ function parseCardLedgerFile(file){
 
     var byDate = {};      // date -> {approvalNo: cardBuyer}  (매출전표 카드 외상매출 매칭용, 전체 PG/VAN)
     var vanByDate = {};   // date -> [VAN 건별 레코드]  (예입전표 VAN 건별 수수료/입금취소 처리용)
+    var vanIdSeen = {};   // 날짜+승인번호+번호+이름이 같은 행이 분할결제 등으로 중복될 때 id 충돌을 막기 위한 카운터
     for(var r=headerRowIdx+1; r<aoa.length; r++){
       var rw = aoa[r];
       if(!rw) continue;
@@ -1357,8 +1358,11 @@ function parseCardLedgerFile(file){
       var pg = colOf['PG구분']!=null ? String(rw[colOf['PG구분']]||'').trim() : '';
       if(dkey && pg.toUpperCase()==='VAN'){
         vanByDate[dkey] = vanByDate[dkey] || [];
+        var baseId = dkey+'_'+apNo+'_'+(colOf['번호']!=null?rw[colOf['번호']]:'')+'_'+String(name).trim();
+        vanIdSeen[baseId] = (vanIdSeen[baseId]||0)+1;
+        var uniqueId = vanIdSeen[baseId]>1 ? baseId+'_'+vanIdSeen[baseId] : baseId; // 첫 건은 기존 id 그대로 유지(기존 저장된 건별 설정과 호환)
         vanByDate[dkey].push({
-          id: dkey+'_'+apNo+'_'+(colOf['번호']!=null?rw[colOf['번호']]:'')+'_'+String(name).trim(),
+          id: uniqueId,
           date: dkey,
           name: String(name).trim(),
           examNo: colOf['수험번호']!=null ? rw[colOf['수험번호']] : '',
