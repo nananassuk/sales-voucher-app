@@ -2511,7 +2511,8 @@ function partitionRefunds(records, bizKey){
     var salesPart = Object.assign({}, r, {
       id: r.id+'_banksales',
       bank: salesBank,
-      items: salesNames.reduce(function(o,nm){ o[nm]=r.items[nm]; return o; }, {})
+      items: salesNames.reduce(function(o,nm){ o[nm]=r.items[nm]; return o; }, {}),
+      __forceBankSales: true
     });
     expandedRecords.push(refundPart, salesPart);
   });
