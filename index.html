@@ -2713,7 +2713,7 @@ function cardCancelDetailRows(bizKey, refundRecords){
     var cat = itemNames.length ? groupLabel(getCategory(bizKey, itemNames[0])) : '기타';
     rows.push({
       name:r.name, examNo:r.examNo, itemName: itemNames.join(', '), category:cat,
-      amount:amount, cardBuyer:cardBuyer, fee:fee, deposit:deposit, ts:r.ts
+      amount:amount, cardBuyer:cardBuyer, fee:fee, deposit:deposit, ts:r.ts, txDate:txDate
     });
   });
   return rows;
@@ -3045,11 +3045,11 @@ function renderCombined(wrap, loaded){
       '<div class="section-title" style="font-size:12.5px;color:var(--card);">💳 카드입금취소 건별(사업장·카드사·수수료·입금액)</div>'+
       '<div class="tableWrap" style="margin-bottom:12px;"><table class="detailTable"><thead><tr>'+
         '<th style="text-align:left">사업장</th><th style="text-align:left">이름</th><th style="text-align:left">품목명</th><th style="text-align:left">구분</th>'+
-        '<th style="text-align:left">카드사</th><th>환불액(거래금액)</th><th>수수료</th><th>입금액</th>'+
+        '<th style="text-align:left">승인일자</th><th style="text-align:left">카드사</th><th>환불액(거래금액)</th><th>수수료</th><th>입금액</th>'+
       '</tr></thead><tbody>'+
       allCardCancelRows.map(function(r){
         return '<tr><td style="text-align:left">'+esc(r.bizLabel)+'</td><td style="text-align:left">'+esc(r.name)+'</td><td style="text-align:left">'+esc(r.itemName)+'</td><td style="text-align:left">'+r.category+'</td>'+
-          '<td style="text-align:left">'+esc(r.cardBuyer||'-')+'</td><td class="num">'+fmt(Math.abs(r.amount))+'</td>'+
+          '<td style="text-align:left">'+esc(r.txDate||'-')+'</td><td style="text-align:left">'+esc(r.cardBuyer||'-')+'</td><td class="num">'+fmt(Math.abs(r.amount))+'</td>'+
           '<td class="num">'+(r.fee!=null?fmt(r.fee):'-')+'</td><td class="num">'+(r.deposit!=null?fmt(r.deposit):'-')+'</td></tr>';
       }).join('')+
       '</tbody></table></div>'
@@ -3089,28 +3089,28 @@ function renderCombined(wrap, loaded){
           '<td class="num">'+fmt(Math.abs(e.amount))+'</td></tr>';
       }).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--ink-soft)">환불 내역 없음</td></tr>')+
       '</tbody></table></div></div>'+
-      '<div style="flex:1;min-width:220px;"><div class="section-title" style="font-size:12.5px;">품목별 환불 합계(구분별)'+
-      (cardCancelCountAll ? '<span class="badge" style="margin-left:6px;background:#eef2f7;color:var(--card);">💳 카드입금취소 '+cardCancelCountAll+'건 포함</span>' : '')+'</div>'+
+      '<div style="flex:1;min-width:220px;"><div class="section-title" style="font-size:12.5px;">품목별 환불 합계(구분별)<span class="hint" style="margin:0 0 0 6px;font-weight:400;">(계좌입금취소만, 카드입금취소는 위 상세에 별도 표시됨)</span></div>'+
       '<div class="tableWrap"><table class="summaryTable"><thead><tr><th style="text-align:left">품목명</th><th style="text-align:left">구분</th><th>환불액</th></tr></thead><tbody>'+
-      (refundLabelOrder.length ? refundLabelOrder.map(function(label){
-        var items = refundGroupsByLabel[label];
-        var byItem = {}; // key: itemName|source -> {itemName, source, amount}
-        items.forEach(function(it){
-          var key = it.itemName+'|'+(it.source||'bank');
-          byItem[key] = byItem[key] || {itemName:it.itemName, source:it.source||'bank', amount:0};
-          byItem[key].amount += it.amount;
-        });
-        var catSum = Object.keys(byItem).reduce(function(s,k){ return s+Math.abs(byItem[k].amount); }, 0);
-        var cardCancelSum = Object.keys(byItem).filter(function(k){ return byItem[k].source==='card_cancel'; })
-          .reduce(function(s,k){ return s+Math.abs(byItem[k].amount); }, 0);
-        return '<tr class="catGroupRow"><td colspan="3">'+label+'<span class="badge" style="margin-left:8px;">'+fmt(catSum)+'</span>'+
-            (cardCancelSum ? '<span class="badge" style="margin-left:6px;background:#eef2f7;color:var(--card);">💳 카드입금취소 '+fmt(cardCancelSum)+'</span>' : '')+
-          '</td></tr>'+
-          Object.keys(byItem).map(function(k){
-            var it = byItem[k];
-            return '<tr><td style="text-align:left">'+esc(it.itemName)+'</td><td style="text-align:left">'+refundSourceBadge(it.source)+'</td><td class="num">'+fmt(Math.abs(it.amount))+'</td></tr>';
-          }).join('');
-      }).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--ink-soft)">환불 내역 없음</td></tr>')+
+      (function(){
+        var anyRows = false;
+        var html = refundLabelOrder.map(function(label){
+          var items = refundGroupsByLabel[label].filter(function(it){ return it.source!=='card_cancel'; });
+          if(!items.length) return '';
+          var byItem = {}; // key: itemName -> {itemName, amount} (은행환불만 남았으므로 source 구분 불필요)
+          items.forEach(function(it){
+            byItem[it.itemName] = byItem[it.itemName] || {itemName:it.itemName, amount:0};
+            byItem[it.itemName].amount += it.amount;
+          });
+          var catSum = Object.keys(byItem).reduce(function(s,k){ return s+Math.abs(byItem[k].amount); }, 0);
+          anyRows = true;
+          return '<tr class="catGroupRow"><td colspan="3">'+label+'<span class="badge" style="margin-left:8px;">'+fmt(catSum)+'</span></td></tr>'+
+            Object.keys(byItem).map(function(k){
+              var it = byItem[k];
+              return '<tr><td style="text-align:left">'+esc(it.itemName)+'</td><td style="text-align:left">'+refundSourceBadge('bank')+'</td><td class="num">'+fmt(Math.abs(it.amount))+'</td></tr>';
+            }).join('');
+        }).join('');
+        return anyRows ? html : '<tr><td colspan="3" style="text-align:center;color:var(--ink-soft)">계좌입금취소(은행환불) 내역 없음</td></tr>';
+      })()+
       '</tbody></table></div></div>'+
       '</div></div>';
   }
@@ -4281,11 +4281,11 @@ function renderResults(){
     var cardCancelRows = cardCancelDetailRows(bizKey, refunds);
     var cardCancelDetailTable = '<div class="tableWrap" style="margin-bottom:12px;"><table class="detailTable"><thead><tr>'+
         '<th style="text-align:left">이름</th><th style="text-align:left">품목명</th><th style="text-align:left">구분</th>'+
-        '<th style="text-align:left">카드사</th><th>환불액(거래금액)</th><th>수수료</th><th>입금액</th>'+
+        '<th style="text-align:left">승인일자</th><th style="text-align:left">카드사</th><th>환불액(거래금액)</th><th>수수료</th><th>입금액</th>'+
       '</tr></thead><tbody>'+
       cardCancelRows.map(function(r){
         return '<tr><td style="text-align:left">'+esc(r.name)+'</td><td style="text-align:left">'+esc(r.itemName)+'</td><td style="text-align:left">'+r.category+'</td>'+
-          '<td style="text-align:left">'+esc(r.cardBuyer||'-')+'</td><td class="num">'+fmt(Math.abs(r.amount))+'</td>'+
+          '<td style="text-align:left">'+esc(r.txDate||'-')+'</td><td style="text-align:left">'+esc(r.cardBuyer||'-')+'</td><td class="num">'+fmt(Math.abs(r.amount))+'</td>'+
           '<td class="num">'+(r.fee!=null?fmt(r.fee):'-')+'</td><td class="num">'+(r.deposit!=null?fmt(r.deposit):'-')+'</td></tr>';
       }).join('')+
       '</tbody></table></div>';
@@ -4318,20 +4318,22 @@ function renderResults(){
           '<td class="num">'+fmt(Math.abs(e.amount))+'</td></tr>';
       }).join('')+
       '</tbody></table></div></div>'+
-      '<div style="flex:1;min-width:220px;"><div class="section-title" style="font-size:12.5px;">품목별 환불 합계(구분별)'+
-      (cardCancelCount ? '<span class="badge" style="margin-left:6px;background:#eef2f7;color:var(--card);">💳 카드입금취소 '+cardCancelCount+'건 포함</span>' : '')+'</div>'+
+      '<div style="flex:1;min-width:220px;"><div class="section-title" style="font-size:12.5px;">품목별 환불 합계(구분별)<span class="hint" style="margin:0 0 0 6px;font-weight:400;">(계좌입금취소만, 카드입금취소는 위 상세에 별도 표시됨)</span></div>'+
       '<div class="tableWrap"><table class="summaryTable"><thead><tr><th style="text-align:left">품목명</th><th style="text-align:left">구분</th><th>환불액</th></tr></thead><tbody>'+
-      refundCatOrder.map(function(cat){
-        var items = refundGroups[cat];
-        var catSum = items.reduce(function(s,it){ return s+Math.abs(it.amount); }, 0);
-        var cardCancelSum = items.filter(function(it){ return it.source==='card_cancel'; }).reduce(function(s,it){ return s+Math.abs(it.amount); }, 0);
-        return '<tr class="catGroupRow"><td colspan="3">'+cat+'<span class="badge" style="margin-left:8px;">'+fmt(catSum)+'</span>'+
-            (cardCancelSum ? '<span class="badge" style="margin-left:6px;background:#eef2f7;color:var(--card);">💳 카드입금취소 '+fmt(cardCancelSum)+'</span>' : '')+
-          '</td></tr>'+
-          items.map(function(it){
-            return '<tr><td style="text-align:left">'+esc(it.itemName)+'</td><td style="text-align:left">'+refundSourceBadge(it.source)+'</td><td class="num">'+fmt(Math.abs(it.amount))+'</td></tr>';
-          }).join('');
-      }).join('')+
+      (function(){
+        var anyRows = false;
+        var html = refundCatOrder.map(function(cat){
+          var items = refundGroups[cat].filter(function(it){ return it.source!=='card_cancel'; });
+          if(!items.length) return '';
+          var catSum = items.reduce(function(s,it){ return s+Math.abs(it.amount); }, 0);
+          anyRows = true;
+          return '<tr class="catGroupRow"><td colspan="3">'+cat+'<span class="badge" style="margin-left:8px;">'+fmt(catSum)+'</span></td></tr>'+
+            items.map(function(it){
+              return '<tr><td style="text-align:left">'+esc(it.itemName)+'</td><td style="text-align:left">'+refundSourceBadge('bank')+'</td><td class="num">'+fmt(Math.abs(it.amount))+'</td></tr>';
+            }).join('');
+        }).join('');
+        return anyRows ? html : '<tr><td colspan="3" style="text-align:center;color:var(--ink-soft)">계좌입금취소(은행환불) 내역 없음</td></tr>';
+      })()+
       '</tbody></table></div></div>'+
       '</div></div>';
   }
