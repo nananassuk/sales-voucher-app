@@ -2448,36 +2448,77 @@ function scopeRecords(bizKey){
 /* 환불(은행 항목 마이너스) 건을 매출 건과 분리 */
 function partitionRefunds(records, bizKey){
   var sales = [], refunds = [];
-  // 은행(계좌) +/- 상쇄쌍 넷팅: 동일 학생·동일 일자·동일 품목 조합에서 은행 값이 양수/음수로 나뉘어
-  // 찍혀있는 경우(현금영수증 변경 등 단순 정정), 순액 기준으로만 매출/환불을 판단한다.
-  // 순액이 0 이상이면 매출로(그대로 두면 자연히 상쇄), 순액이 음수면 그 그룹 전체를 환불로 보낸다
-  // (netRefunds가 품목 단위로 다시 합산해줘서 결과적으로 순액만 환불로 잡힘).
-  var bankGroupKeyOf = function(r){
-    var itemKey = Object.keys(r.items).sort().join(',');
-    return studentIdOf(r)+'|'+r.date+'|'+itemKey;
-  };
-  var bankGroups = {};
+  // 은행(계좌) +/- 상쇄쌍 넷팅: "행(전체 품목 조합)" 단위가 아니라 "품목 하나하나" 단위로 넷팅한다.
+  // (기숙사비+식대+모의고사가 한 줄로 묶여서 환불됐다가, 그 중 모의고사만 단독으로 재납부되는 경우처럼
+  //  묶음 전체가 아니라 특정 품목 하나만 상쇄되는 경우에 대응하기 위함)
+  // 동일 학생·동일 일자·동일 품목명에서 은행 몫의 순액이 0 이상이면 그 품목 몫은 매출(자연 상쇄),
+  // 순액이 음수면 그 품목 몫은 환불로 보낸다.
+  var itemBankGroups = {}; // studentId|date|품목명 -> [{record, itemName, share}]
   records.forEach(function(r){
     if(!r.bank) return;
-    var key = bankGroupKeyOf(r);
-    (bankGroups[key] = bankGroups[key] || []).push(r);
-  });
-  var forceRefundIds = {}, forceSalesIds = {};
-  Object.keys(bankGroups).forEach(function(key){
-    var group = bankGroups[key];
-    var hasPos = group.some(function(r){ return r.bank>0; });
-    var hasNeg = group.some(function(r){ return r.bank<0; });
-    if(!(hasPos && hasNeg)) return; // 상쇄쌍이 아니면(전부 같은 부호) 원래 로직 그대로
-    var netBank = group.reduce(function(s,r){ return s+r.bank; }, 0);
-    group.forEach(function(r){
-      if(netBank >= -0.5) forceSalesIds[r.id] = true; // 순액 0 이상 -> 전부 매출(자연 상쇄)
-      else forceRefundIds[r.id] = true; // 순액 음수 -> 전부 환불(netRefunds가 순액으로 재합산)
+    var denom = r.va + r.card + r.cash + r.bank;
+    if(!denom) return;
+    Object.keys(r.items).forEach(function(itemName){
+      var amt = r.items[itemName];
+      if(!amt) return;
+      var share = amt * (r.bank/denom);
+      if(!share) return;
+      var key = studentIdOf(r)+'|'+r.date+'|'+itemName;
+      (itemBankGroups[key] = itemBankGroups[key] || []).push({record:r, itemName:itemName, share:share});
     });
   });
+  var itemDecision = {}; // record.id+'|'+품목명 -> 'sales'|'refund' (상쇄쌍인 품목에 대해서만 세팅됨)
+  Object.keys(itemBankGroups).forEach(function(key){
+    var list = itemBankGroups[key];
+    var hasPos = list.some(function(x){ return x.share>0; });
+    var hasNeg = list.some(function(x){ return x.share<0; });
+    if(!(hasPos && hasNeg)) return; // 상쇄쌍이 아니면(전부 같은 부호) 그대로 두고 원래 로직 적용
+    var net = list.reduce(function(s,x){ return s+x.share; }, 0);
+    var decision = (net >= -0.5) ? 'sales' : 'refund';
+    list.forEach(function(x){ itemDecision[x.record.id+'|'+x.itemName] = decision; });
+  });
 
+  // 품목별 결정에 따라, 필요한 레코드만 "환불로 갈 품목 묶음"과 "매출로 남을 품목 묶음"으로 쪼갠다.
+  var expandedRecords = [];
   records.forEach(function(r){
-    if(forceSalesIds[r.id]){ sales.push(r); return; }
-    if(forceRefundIds[r.id]){ r.refundSource = 'bank'; refunds.push(r); return; }
+    if(!r.bank){ expandedRecords.push(r); return; }
+    var itemNames = Object.keys(r.items).filter(function(nm){ return r.items[nm]; });
+    if(!itemNames.length){ expandedRecords.push(r); return; }
+    var anyDecision = itemNames.some(function(nm){ return itemDecision[r.id+'|'+nm]; });
+    if(!anyDecision){ expandedRecords.push(r); return; } // 이 행에 상쇄쌍 품목이 하나도 없으면 원래 로직 그대로
+
+    var decidedSales = itemNames.filter(function(nm){ return itemDecision[r.id+'|'+nm]==='sales'; });
+    var decidedRefund = itemNames.filter(function(nm){ return itemDecision[r.id+'|'+nm]==='refund'; });
+    var undecided = itemNames.filter(function(nm){ return !itemDecision[r.id+'|'+nm]; });
+    var denom = r.va + r.card + r.cash + r.bank;
+    // 상쇄쌍이 아닌(결정 없는) 품목들은 원래 로직대로: 그 품목들 은행 몫의 부호로 기본 귀속을 정한다
+    var undecidedBankSum = undecided.reduce(function(s,nm){ return s + r.items[nm]*(r.bank/denom); }, 0);
+    var undecidedGoesTo = undecidedBankSum < 0 ? 'refund' : 'sales';
+    var salesNames = decidedSales.concat(undecidedGoesTo==='sales' ? undecided : []);
+    var refundNames = decidedRefund.concat(undecidedGoesTo==='refund' ? undecided : []);
+
+    if(!refundNames.length){ r.__forceBankSales = true; expandedRecords.push(r); return; }
+    if(!salesNames.length){ r.__forceBankRefund = true; expandedRecords.push(r); return; }
+    // 진짜로 섞여있으면 품목 단위로 둘로 쪼갠다
+    var refundBank = refundNames.reduce(function(s,nm){ return s + r.items[nm]*(r.bank/denom); }, 0);
+    var salesBank = r.bank - refundBank;
+    var refundPart = Object.assign({}, r, {
+      id: r.id+'_bankrefund',
+      bank: refundBank,
+      items: refundNames.reduce(function(o,nm){ o[nm]=r.items[nm]; return o; }, {}),
+      __forceBankRefund: true
+    });
+    var salesPart = Object.assign({}, r, {
+      id: r.id+'_banksales',
+      bank: salesBank,
+      items: salesNames.reduce(function(o,nm){ o[nm]=r.items[nm]; return o; }, {})
+    });
+    expandedRecords.push(refundPart, salesPart);
+  });
+
+  expandedRecords.forEach(function(r){
+    if(r.__forceBankSales){ sales.push(r); return; }
+    if(r.__forceBankRefund){ r.refundSource = 'bank'; refunds.push(r); return; }
     // 환불(계좌 취소)은 은행 항목 마이너스만 해당. 카드 마이너스는 원래 카드 취소(넷팅)일 뿐 매출로 합산되지만,
     // "입금취소"로 직접 표시한 건은 상계할 대상이 없는 실제 환불이므로 여기서 제외해 환불로 이동시킴.
     if(r.bank < 0){ r.refundSource = 'bank'; refunds.push(r); return; }
