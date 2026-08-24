@@ -2348,18 +2348,27 @@ function markClosingDropzone(key, fname, isError){
 }
 function handleClosingUpload(key, file){
   var parseFn = key==='va' ? parseVaClosingFile : parseCardClosingFile;
-  parseFn(file).then(function(records){
-    if(!records.length){ toast('유효한 데이터를 찾지 못했습니다.'); return; }
-    state.deposit[key] = records;
+  parseFn(file).then(function(newRecords){
+    if(!newRecords.length){ toast('유효한 데이터를 찾지 못했습니다.'); return; }
+    // 통합매출장처럼 날짜(마감일자) 단위로 병합한다: 새 파일에 있는 날짜만 교체하고,
+    // 그 외 날짜(예: 이전에 올린 다른 달 자료)는 그대로 유지한다.
+    var newDates = {};
+    newRecords.forEach(function(r){ newDates[r.closeDate] = true; });
+    var existing = state.deposit[key] || [];
+    var kept = existing.filter(function(r){ return !newDates[r.closeDate]; });
+    var merged = kept.concat(newRecords);
+    merged.sort(function(a,b){ return a.closeDate<b.closeDate?-1:(a.closeDate>b.closeDate?1:0); });
+    state.deposit[key] = merged;
     state.deposit[key+'FileName'] = file.name;
     state.deposit[key+'UploadedAt'] = new Date();
     saveClosingRecords(key);
     markClosingDropzone(key, file.name);
     if(!state.deposit.activeDepositBiz){
-      var bizzes = {}; records.forEach(function(r){ bizzes[r.biz]=1; });
+      var bizzes = {}; newRecords.forEach(function(r){ bizzes[r.biz]=1; });
       state.deposit.activeDepositBiz = Object.keys(bizzes)[0];
     }
-    toast('마감내역 반영 완료 · '+records.length+'건');
+    var newDateCount = Object.keys(newDates).length;
+    toast('마감내역 반영 완료 · 새 파일 '+newRecords.length+'건('+newDateCount+'일 갱신), 기존 유지 '+kept.length+'건');
     renderDepositPage();
     if(state.activePage==='deferred') renderDeferredPage();
   }).catch(function(err){
