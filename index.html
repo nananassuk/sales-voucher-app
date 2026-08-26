@@ -2711,7 +2711,7 @@ function aggregate(bizKey, records){
       var catPortion = recCatKeys.length===1 ? 1 : (recCatAmounts[cat]/recTotalItemAmt);
       var recTaxAmt = (r.taxAmt||0)*catPortion, recVat = (r.vat||0)*catPortion;
       var chDenom = r.va + r.card + r.cash; // 매출 스코프이므로 은행(환불)은 채널 배분 대상에서 제외
-      if(chDenom>0){
+      if(chDenom){
         if(r.va){ t.vaTaxAmt += recTaxAmt*(r.va/chDenom); t.vaVat += recVat*(r.va/chDenom); }
         if(r.card){ t.cardTaxAmt += recTaxAmt*(r.card/chDenom); t.cardVat += recVat*(r.card/chDenom); }
         if(r.cash){ t.cashTaxAmt += recTaxAmt*(r.cash/chDenom); t.cashVat += recVat*(r.cash/chDenom); }
