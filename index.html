@@ -997,7 +997,7 @@ var state = {
   }
 };
 BIZ_ORDER.forEach(function(k){
-  state.biz[k] = {records:[], dates:[], filter:{mode:'day', day:null, start:null, end:null}, fileName:null, uploadedAt:null, cardBuyerMap:{}, salesDoneDates:{}, refundDoneDates:{}, depositDoneDates:{}, cardLedgerRecords:[], vanFeeOverrides:{}, depositCancelFlags:{}, vanDepositByRecord:{}};
+  state.biz[k] = {records:[], dates:[], filter:{mode:'day', day:null, start:null, end:null}, fileName:null, uploadedAt:null, cardBuyerMap:{}, salesDoneDates:{}, refundDoneDates:{}, depositDoneDates:{}, cardLedgerRecords:[], vanFeeOverrides:{}, depositCancelFlags:{}, vanDepositByRecord:{}, pgDepositOverrides:{}};
 });
 
 /* ---------------------------------------------------------------
@@ -1726,6 +1726,25 @@ function loadVanDepositByRecord(bizKey){
 function saveVanDepositByRecord(bizKey){
   return storageAdapter.set('vanDepositByRecord:'+bizKey, JSON.stringify(state.biz[bizKey].vanDepositByRecord)).catch(function(){});
 }
+/* PG 예입일자 직접 수정(마감내역_신용카드 기준). 정산일자를 그대로 예입일자로 쓰는 게 기본이지만,
+   마이너스(환불) 건 등은 실제 정산일이 다를 수 있어 승인번호(closeDate+approvalNo) 단위로 덮어쓸 수 있게 한다.
+   원본 정산일자는 cr.rawSettleDate에 따로 보존해서, 덮어쓴 값을 지우면 다시 원래대로 돌아가게 한다. */
+function loadPgDepositOverrides(bizKey){
+  return storageAdapter.get('pgDepositOverrides:'+bizKey).then(function(r){
+    state.biz[bizKey].pgDepositOverrides = r ? JSON.parse(r.value) : {};
+  }).catch(function(){ state.biz[bizKey].pgDepositOverrides = state.biz[bizKey].pgDepositOverrides || {}; });
+}
+function savePgDepositOverrides(bizKey){
+  return storageAdapter.set('pgDepositOverrides:'+bizKey, JSON.stringify(state.biz[bizKey].pgDepositOverrides)).catch(function(){});
+}
+function applyPgDepositOverrides(){
+  (state.deposit.card||[]).forEach(function(cr){
+    if(cr.rawSettleDate==null) cr.rawSettleDate = cr.settleDate; // 최초 1회만 원본 보존
+    var bizSt = state.biz[cr.biz];
+    var override = bizSt && bizSt.pgDepositOverrides ? bizSt.pgDepositOverrides[cr.closeDate+'|'+cr.approvalNo] : null;
+    cr.settleDate = override || cr.rawSettleDate;
+  });
+}
 function loadVaVanDepositDates(){
   return storageAdapter.get('vaVanDepositDates').then(function(r){
     state.deposit.vaVanDepositDates = r ? JSON.parse(r.value) : {};
@@ -1897,7 +1916,10 @@ function finalizeBizLoad(bizKey){
       if(!cf.start){ cf.start = allDates[0]; cf.end = allDates[allDates.length-1]; }
     }
     if(!state.activeBiz) state.activeBiz = bizKey;
-    return Promise.all([loadDoneDates(bizKey), loadCardLedgerMap(bizKey), loadVanFeeOverrides(bizKey), loadDepositCancelFlags(bizKey), loadVanDepositByRecord(bizKey), loadDeferredSelections(bizKey)]);
+    return Promise.all([loadDoneDates(bizKey), loadCardLedgerMap(bizKey), loadVanFeeOverrides(bizKey), loadDepositCancelFlags(bizKey), loadVanDepositByRecord(bizKey), loadDeferredSelections(bizKey), loadPgDepositOverrides(bizKey)]).then(function(res){
+      applyPgDepositOverrides();
+      return res;
+    });
   }).then(function(){
     render();
   });
@@ -2359,6 +2381,7 @@ function handleClosingUpload(key, file){
     var merged = kept.concat(newRecords);
     merged.sort(function(a,b){ return a.closeDate<b.closeDate?-1:(a.closeDate>b.closeDate?1:0); });
     state.deposit[key] = merged;
+    if(key==='card') applyPgDepositOverrides();
     state.deposit[key+'FileName'] = file.name;
     state.deposit[key+'UploadedAt'] = new Date();
     saveClosingRecords(key);
@@ -3537,7 +3560,7 @@ function renderDepositEntryView(wrap, loaded){
   var apGroups = {};
   cardScoped.forEach(function(r){
     var key = r.closeDate+'|'+r.approvalNo;
-    var g = apGroups[key] = apGroups[key] || {closeDate:r.closeDate, settleDate:r.settleDate, approvalNo:r.approvalNo, depositAmt:0, fees:0, txAmt:0};
+    var g = apGroups[key] = apGroups[key] || {closeDate:r.closeDate, settleDate:r.settleDate, rawSettleDate:r.rawSettleDate||r.settleDate, approvalNo:r.approvalNo, depositAmt:0, fees:0, txAmt:0};
     g.depositAmt += r.depositAmt; g.fees += r.fees; g.txAmt += r.txAmt;
   });
   var apKeys = Object.keys(apGroups);
@@ -3671,16 +3694,19 @@ function renderDepositEntryView(wrap, loaded){
         : '⚠️ PG 승인번호 기준 불일치 '+pgMismatches+'건 (건별 내역에서 확인 필요)')+
     '</div>' : '';
 
-  var pgDetailHtml = '<details data-persist-id="pgDetail-'+bizKey+'"'+detailsOpenAttr('pgDetail-'+bizKey)+' style="margin-top:14px;"><summary class="section-title" style="font-size:12.5px;display:inline;cursor:pointer;">PG 건별 내역(마감일자=거래일자, 정산일자 기준으로 전표 작성) — 클릭해서 펼치기/접기</summary>'+
+  var pgDetailHtml = '<details data-persist-id="pgDetail-'+bizKey+'"'+detailsOpenAttr('pgDetail-'+bizKey)+' style="margin-top:14px;"><summary class="section-title" style="font-size:12.5px;display:inline;cursor:pointer;">PG 건별 내역(마감일자=거래일자, 정산일자 기준으로 전표 작성 · 예입일자 직접 수정 가능) — 클릭해서 펼치기/접기</summary>'+
     '<div class="tableWrap" style="margin-top:6px;"><table class="detailTable"><thead><tr>'+
-      '<th>거래일자(마감)</th><th>정산일자</th><th>승인번호</th><th>정산금액(입금액)</th><th>수수료</th><th>거래금액</th><th>매출전표 승인금액</th>'+
+      '<th>거래일자(마감)</th><th>정산일자</th><th>승인번호</th><th>정산금액(입금액)</th><th>수수료</th><th>거래금액</th><th>매출전표 승인금액</th><th style="text-align:left">예입일자</th>'+
     '</tr></thead><tbody>'+
     (apKeys.length ? apKeys.sort(function(a,b){ return apGroups[a].closeDate<apGroups[b].closeDate?-1:1; }).map(function(k){
       var g = apGroups[k];
-      return '<tr'+(g.mismatch?' style="background:var(--bad-soft)"':'')+'><td>'+g.closeDate+'</td><td>'+g.settleDate+'</td><td>'+esc(g.approvalNo)+'</td>'+
+      var overrideKey = g.closeDate+'|'+g.approvalNo;
+      var overrideVal = (state.biz[bizKey].pgDepositOverrides||{})[overrideKey];
+      return '<tr'+(g.mismatch?' style="background:var(--bad-soft)"':'')+'><td>'+g.closeDate+'</td><td>'+(g.rawSettleDate||g.settleDate)+'</td><td>'+esc(g.approvalNo)+'</td>'+
         '<td class="num">'+fmt(g.depositAmt)+'</td><td class="num">'+fmt(g.fees)+'</td><td class="num">'+fmt(g.txAmt)+'</td>'+
-        '<td class="num">'+fmt(g.salesSum)+'</td></tr>';
-    }).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--ink-soft)">해당 기간 PG 마감내역 없음</td></tr>')+
+        '<td class="num">'+fmt(g.salesSum)+'</td>'+
+        '<td style="text-align:left"><input type="date" class="pgDepositOverrideInput" style="'+(overrideVal?'border-color:var(--accent);color:var(--accent);':'')+'" data-closedate="'+g.closeDate+'" data-apno="'+esc(g.approvalNo)+'" value="'+(overrideVal||g.settleDate||'')+'"></td></tr>';
+    }).join('') : '<tr><td colspan="8" style="text-align:center;color:var(--ink-soft)">해당 기간 PG 마감내역 없음</td></tr>')+
     '</tbody></table></div>'+
     '</details>';
 
@@ -3717,6 +3743,19 @@ function renderDepositEntryView(wrap, loaded){
       var id = inp.getAttribute('data-id');
       if(inp.value===''){ delete byRecordDatesRef[id]; } else { byRecordDatesRef[id] = inp.value; }
       saveVanDepositByRecord(bizKey).then(function(){ renderDepositPage(); });
+    });
+  });
+  Array.prototype.forEach.call(wrap.querySelectorAll('.pgDepositOverrideInput'), function(inp){
+    inp.addEventListener('change', function(){
+      var key = inp.getAttribute('data-closedate')+'|'+inp.getAttribute('data-apno');
+      state.biz[bizKey].pgDepositOverrides = state.biz[bizKey].pgDepositOverrides || {};
+      if(inp.value===''){ delete state.biz[bizKey].pgDepositOverrides[key]; }
+      else { state.biz[bizKey].pgDepositOverrides[key] = inp.value; }
+      applyPgDepositOverrides();
+      savePgDepositOverrides(bizKey).then(function(){
+        toast(inp.value ? '예입일자를 '+inp.value+'로 수정했습니다' : '예입일자를 원래 정산일자로 되돌렸습니다');
+        renderDepositPage();
+      });
     });
   });
   var vanSelectAll = document.getElementById('vanSelectAll');
@@ -4581,6 +4620,7 @@ window.startApp = function(){
     });
   });
   Promise.all([loadFeeRates(), loadVaVanDepositDates(), loadClosingRecords('va'), loadClosingRecords('card'), loadAcademicYear()]).then(function(){
+    applyPgDepositOverrides();
     renderFeeRateEditor();
     renderHistoryPage();
     // 마감내역 로딩이 비동기라 늦게 끝날 수 있어, 이미 다른 탭을 보고 있었다면 최신 데이터로 다시 그려준다.
