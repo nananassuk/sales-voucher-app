@@ -997,7 +997,8 @@ var state = {
   },
   taxInvoice: {
     activeBiz: null,
-    filter: {mode:'range', day:null, start:null, end:null} // 거래일자(=마감일자) 기준
+    filter: {mode:'range', day:null, start:null, end:null}, // 거래일자(=마감일자) 기준
+    refDate: null // 정산기준일: 이 날짜 이전 정산이면 입금완료, 이후(아직)면 미지급금. 비워두면 오늘.
   },
   deferred: {
     activeDeferredBiz: null,
@@ -3427,8 +3428,8 @@ function vaVanRecordsInScope(bizKey, f){
 }
 
 /* =================== 세금계산서전표(거래일자=마감일자 기준, PG 전용) =================== */
-function pgTaxInvoiceSummary(scoped){
-  var today = todayDateStr();
+function pgTaxInvoiceSummary(scoped, refDate){
+  var today = refDate || todayDateStr();
   var txAmt=0, fees=0, deposited=0, unpaid=0;
   scoped.forEach(function(r){
     txAmt += r.txAmt; fees += r.fees;
@@ -3457,13 +3458,9 @@ function renderTaxInvoicePage(){
     state.deposit.va.concat(state.deposit.card).forEach(function(r){ if(r.biz===bizKey && (!maxCloseDate || r.closeDate>maxCloseDate)) maxCloseDate = r.closeDate; });
     if(maxCloseDate){ f.start = maxCloseDate; f.end = maxCloseDate; }
   }
-
-  var tabsHtml = '<div class="bizTabs no-print">' + loaded.map(function(k){
-    var active = k===bizKey ? ' active' : '';
-    return '<button class="'+active.trim()+'" data-biz="'+k+'">'+BIZ[k].label+'</button>';
-  }).join('') + '</div>';
-
   var todayStr = todayDateStr();
+  var refDate = state.taxInvoice.refDate || todayStr;
+
   var toolbarHtml = '<div class="toolbar no-print">'+
     '<div class="left">'+
       '<div class="modeToggle">'+
@@ -3479,19 +3476,29 @@ function renderTaxInvoicePage(){
         '<input type="date" id="tiRangeStart" value="'+(f.start||'')+'"> ~ '+
         '<input type="date" id="tiRangeEnd" value="'+(f.end||'')+'">'
       : '<span class="hint" style="margin:0;">전체 기간</span>')+
+      '<span style="margin-left:14px;padding-left:14px;border-left:1px solid var(--line-strong);display:inline-flex;align-items:center;gap:6px;">'+
+        '<label style="font-size:12.5px;color:var(--ink-soft);" title="이 날짜 이전에 정산되면 입금완료, 이후(아직 도래 안 함)면 미지급금으로 표시됩니다. 비워두면 오늘('+todayStr+') 기준.">정산기준일</label>'+
+        '<input type="date" id="tiRefDate" value="'+(state.taxInvoice.refDate||'')+'" placeholder="오늘">'+
+        (state.taxInvoice.refDate ? '<button class="btn ghost small" id="tiRefDateReset">오늘로</button>' : '')+
+      '</span>'+
     '</div>'+
     '<div class="btn-row"><button class="btn small" id="tiExcelExport">엑셀 다운로드</button></div>'+
   '</div>';
 
+  var tabsHtml = '<div class="bizTabs no-print">' + loaded.map(function(k){
+    var active = k===bizKey ? ' active' : '';
+    return '<button class="'+active.trim()+'" data-biz="'+k+'">'+BIZ[k].label+'</button>';
+  }).join('') + '</div>';
+
   function sectionHtml(title, hintLabel, recArr, idPrefix){
     var scoped = depositScopeRecords(recArr, bizKey, f); // basis 기본값(approval)=closeDate 기준, 즉 거래일자 기준
-    var s = pgTaxInvoiceSummary(scoped);
+    var s = pgTaxInvoiceSummary(scoped, refDate);
     var chipHtml = '<div class="chipRow">'+
       '<div class="chip">건수<b class="num">'+s.count+'</b></div>'+
       '<div class="chip">거래금액<b class="num">'+fmt(s.txAmt)+'</b></div>'+
       '<div class="chip">수수료<b class="num">'+fmt(s.fees)+'</b></div>'+
-      '<div class="chip" style="border-left-color:var(--good);">입금액(정산일자≤오늘)<b class="num">'+fmt(s.deposited)+'</b></div>'+
-      '<div class="chip" style="border-left-color:var(--bad);">미지급금(정산일자&gt;오늘)<b class="num">'+fmt(s.unpaid)+'</b></div>'+
+      '<div class="chip" style="border-left-color:var(--good);">입금액(정산일자≤기준일)<b class="num">'+fmt(s.deposited)+'</b></div>'+
+      '<div class="chip" style="border-left-color:var(--bad);">미지급금(정산일자&gt;기준일)<b class="num">'+fmt(s.unpaid)+'</b></div>'+
     '</div>';
     var rows = scoped.slice().sort(function(a,b){ return a.closeDate<b.closeDate?-1:(a.closeDate>b.closeDate?1:(a.approvalNo<b.approvalNo?-1:1)); });
     var detailHtml = '<details data-persist-id="'+idPrefix+'-'+bizKey+'"'+detailsOpenAttr(idPrefix+'-'+bizKey)+' style="margin-top:10px;">'+
@@ -3500,21 +3507,21 @@ function renderTaxInvoicePage(){
         '<th>거래일자(마감)</th><th>정산일자</th><th>승인번호</th><th>거래금액</th><th>수수료</th><th>입금액</th><th style="text-align:left">상태</th>'+
       '</tr></thead><tbody>'+
       (rows.length ? rows.map(function(r){
-        var isUnpaid = !(r.settleDate && r.settleDate<=todayStr);
+        var isUnpaid = !(r.settleDate && r.settleDate<=refDate);
         return '<tr'+(isUnpaid?' style="background:var(--bad-soft)"':'')+'><td>'+r.closeDate+'</td><td>'+(r.settleDate||'-')+'</td><td>'+esc(r.approvalNo)+'</td>'+
           '<td class="num">'+fmt(r.txAmt)+'</td><td class="num">'+fmt(r.fees)+'</td><td class="num">'+fmt(r.depositAmt)+'</td>'+
           '<td style="text-align:left">'+(isUnpaid?'<span style="color:var(--bad);">미지급</span>':'입금완료')+'</td></tr>';
       }).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--ink-soft)">해당 기간 PG 마감내역 없음</td></tr>')+
       '</tbody></table></div></details>';
     return '<div class="card"><div class="section-title">'+title+'<span class="badge">'+hintLabel+'</span></div>'+
-      '<div class="hint">거래일자(=마감일자) 기준으로 집계됩니다. 정산일자가 오늘('+todayStr+') 이전이면 입금액, 이후(아직 도래하지 않음)면 미지급금으로 표시됩니다.</div>'+
+      '<div class="hint">거래일자(=마감일자) 기준으로 집계됩니다. 정산일자가 정산기준일('+refDate+(state.taxInvoice.refDate?'':', 오늘')+') 이전이면 입금액, 이후(아직 도래하지 않음)면 미지급금으로 표시됩니다.</div>'+
       chipHtml + detailHtml + '</div>';
   }
 
   var vaSectionHtml = sectionHtml('가상계좌(PG)', taxInvoiceScopeLabel(f), state.deposit.va, 'tiVaPg');
   var cardSectionHtml = sectionHtml('신용카드(PG)', taxInvoiceScopeLabel(f), state.deposit.card, 'tiCardPg');
 
-  wrap.innerHTML = '<div class="stickyBlock">'+tabsHtml+toolbarHtml+'</div>'+vaSectionHtml+cardSectionHtml;
+  wrap.innerHTML = '<div class="stickyBlock">'+toolbarHtml+tabsHtml+'</div>'+vaSectionHtml+cardSectionHtml;
   syncStickyOffset();
 
   Array.prototype.forEach.call(wrap.querySelectorAll('.bizTabs button'), function(btn){
@@ -3534,18 +3541,24 @@ function renderTaxInvoicePage(){
     tiRs.addEventListener('change', function(){ f.start = tiRs.value; renderTaxInvoicePage(); });
     tiRe.addEventListener('change', function(){ f.end = tiRe.value; renderTaxInvoicePage(); });
   }
-  document.getElementById('tiExcelExport').addEventListener('click', function(){ exportTaxInvoiceDetail(bizKey, f); });
+  document.getElementById('tiRefDate').addEventListener('change', function(e){
+    state.taxInvoice.refDate = e.target.value || null;
+    renderTaxInvoicePage();
+  });
+  var tiRefDateReset = document.getElementById('tiRefDateReset');
+  if(tiRefDateReset) tiRefDateReset.addEventListener('click', function(){ state.taxInvoice.refDate = null; renderTaxInvoicePage(); });
+  document.getElementById('tiExcelExport').addEventListener('click', function(){ exportTaxInvoiceDetail(bizKey, f, refDate); });
   bindDetailsToggle(wrap);
 }
-function exportTaxInvoiceDetail(bizKey, f){
-  var todayStr = todayDateStr();
+function exportTaxInvoiceDetail(bizKey, f, refDate){
+  refDate = refDate || todayDateStr();
   var wb = XLSX.utils.book_new();
   var aoa = [['구분','거래일자(마감)','정산일자','승인번호','거래금액','수수료','입금액','상태']];
   [['가상계좌(PG)', state.deposit.va], ['신용카드(PG)', state.deposit.card]].forEach(function(pair){
     var label = pair[0], recArr = pair[1];
     var scoped = depositScopeRecords(recArr, bizKey, f).slice().sort(function(a,b){ return a.closeDate<b.closeDate?-1:1; });
     scoped.forEach(function(r){
-      var isUnpaid = !(r.settleDate && r.settleDate<=todayStr);
+      var isUnpaid = !(r.settleDate && r.settleDate<=refDate);
       aoa.push([label, r.closeDate, r.settleDate||'', r.approvalNo, r.txAmt, r.fees, r.depositAmt, isUnpaid?'미지급':'입금완료']);
     });
   });
