@@ -1007,7 +1007,7 @@ var state = {
   }
 };
 BIZ_ORDER.forEach(function(k){
-  state.biz[k] = {records:[], dates:[], filter:{mode:'day', day:null, start:null, end:null}, fileName:null, uploadedAt:null, cardBuyerMap:{}, salesDoneDates:{}, refundDoneDates:{}, depositDoneDates:{}, cardLedgerRecords:[], vanFeeOverrides:{}, depositCancelFlags:{}, vanDepositByRecord:{}, pgDepositOverrides:{}};
+  state.biz[k] = {records:[], dates:[], filter:{mode:'day', day:null, start:null, end:null}, fileName:null, uploadedAt:null, cardBuyerMap:{}, salesDoneDates:{}, refundDoneDates:{}, depositDoneDates:{}, cardLedgerRecords:[], vanFeeOverrides:{}, depositCancelFlags:{}, vanDepositByRecord:{}, pgDepositOverrides:{}, pgHolds:[]};
 });
 
 /* ---------------------------------------------------------------
@@ -1755,6 +1755,48 @@ function applyPgDepositOverrides(){
     cr.settleDate = override || cr.rawSettleDate;
   });
 }
+/* 신용카드(PG) 정산일자별 마이너스 이월 + 정산보류금액 반영.
+   어느 날 정산금액 합계가 마이너스면(취소가 몰려서), 그 마이너스는 그 날 입금되는 게 아니라
+   플러스로 전환되는 다음 날(들)까지 이월됐다가 그날 한꺼번에 인식된다.
+   정산보류금액(사업장 단위, 건별이 아님)은 보류일에 그만큼 빼고 보류해제일에 그만큼 더해서 반영한다. */
+function cardPgSettleDateSummary(bizKey){
+  var byDate = {}; // settleDate -> {rawDeposit, fees, txAmt}
+  state.deposit.card.filter(function(r){ return r.biz===bizKey; }).forEach(function(r){
+    var d = r.settleDate; if(!d) return;
+    var e = byDate[d] = byDate[d] || {rawDeposit:0, fees:0, txAmt:0};
+    e.rawDeposit += r.depositAmt; e.fees += r.fees; e.txAmt += r.txAmt;
+  });
+  var holds = state.biz[bizKey].pgHolds || [];
+  var holdByDate = {}, releaseByDate = {};
+  holds.forEach(function(h){
+    holdByDate[h.holdDate] = (holdByDate[h.holdDate]||0) + Number(h.amount||0);
+    releaseByDate[h.releaseDate] = (releaseByDate[h.releaseDate]||0) + Number(h.amount||0);
+  });
+  var allDates = {};
+  Object.keys(byDate).forEach(function(d){ allDates[d]=1; });
+  Object.keys(holdByDate).forEach(function(d){ allDates[d]=1; });
+  Object.keys(releaseByDate).forEach(function(d){ allDates[d]=1; });
+  var dates = Object.keys(allDates).sort();
+  var carry = 0;
+  var result = {};
+  dates.forEach(function(d){
+    var e = byDate[d] || {rawDeposit:0, fees:0, txAmt:0};
+    var holdOut = holdByDate[d]||0, holdIn = releaseByDate[d]||0;
+    var effective = e.rawDeposit + carry - holdOut + holdIn;
+    var recognized = effective < 0 ? 0 : effective;
+    result[d] = {recognizedDeposit: recognized, fees:e.fees, txAmt:e.txAmt, rawDeposit:e.rawDeposit, holdOut:holdOut, holdIn:holdIn, carriedIn:carry};
+    carry = effective < 0 ? effective : 0;
+  });
+  return result; // settleDate -> {recognizedDeposit, fees, txAmt, rawDeposit, holdOut, holdIn, carriedIn}
+}
+function loadPgHolds(bizKey){
+  return storageAdapter.get('pgHolds:'+bizKey).then(function(r){
+    state.biz[bizKey].pgHolds = r ? JSON.parse(r.value) : [];
+  }).catch(function(){ state.biz[bizKey].pgHolds = state.biz[bizKey].pgHolds || []; });
+}
+function savePgHolds(bizKey){
+  return storageAdapter.set('pgHolds:'+bizKey, JSON.stringify(state.biz[bizKey].pgHolds)).catch(function(){});
+}
 function loadVaVanDepositDates(){
   return storageAdapter.get('vaVanDepositDates').then(function(r){
     state.deposit.vaVanDepositDates = r ? JSON.parse(r.value) : {};
@@ -1926,7 +1968,7 @@ function finalizeBizLoad(bizKey){
       if(!cf.start){ cf.start = allDates[0]; cf.end = allDates[allDates.length-1]; }
     }
     if(!state.activeBiz) state.activeBiz = bizKey;
-    return Promise.all([loadDoneDates(bizKey), loadCardLedgerMap(bizKey), loadVanFeeOverrides(bizKey), loadDepositCancelFlags(bizKey), loadVanDepositByRecord(bizKey), loadDeferredSelections(bizKey), loadPgDepositOverrides(bizKey)]).then(function(res){
+    return Promise.all([loadDoneDates(bizKey), loadCardLedgerMap(bizKey), loadVanFeeOverrides(bizKey), loadDepositCancelFlags(bizKey), loadVanDepositByRecord(bizKey), loadDeferredSelections(bizKey), loadPgDepositOverrides(bizKey), loadPgHolds(bizKey)]).then(function(res){
       applyPgDepositOverrides();
       return res;
     });
@@ -3784,6 +3826,26 @@ function renderDepositEntryView(wrap, loaded){
     (!vanBuyerList.length && !apKeys.length ? '<tr><td colspan="5" style="text-align:center;color:var(--ink-soft)">해당 기간 신용카드 매출 없음</td></tr>' : '')+
     '</tbody></table></div>';
 
+  var pgHolds = state.biz[bizKey].pgHolds || [];
+  var pgHoldsHtml = '<div class="card" style="margin-bottom:12px;padding:12px 16px;">'+
+    '<div class="section-title" style="font-size:12.5px;">💳 신용카드(PG) 정산보류금액 관리</div>'+
+    '<div class="hint">매출이 너무 많이 취소되면 PG사가 정산금액의 일부를 잠시 보류했다가 나중에 몰아서 풀어주는 경우가 있어요. 보류금액·보류일·보류해제일을 입력해두면 전표작성(취합·예입일자 기준)에서 보류일엔 그만큼 빠지고 보류해제일엔 그만큼 더해져서 반영됩니다.</div>'+
+    (pgHolds.length ? '<div class="tableWrap" style="margin:8px 0;"><table class="summaryTable"><thead><tr>'+
+      '<th style="text-align:left">보류일</th><th style="text-align:left">보류해제일</th><th>보류금액</th><th></th>'+
+    '</tr></thead><tbody>'+
+      pgHolds.map(function(h,i){
+        return '<tr><td style="text-align:left">'+h.holdDate+'</td><td style="text-align:left">'+h.releaseDate+'</td>'+
+          '<td class="num">'+fmt(h.amount)+'</td><td><button class="btn ghost small pgHoldDelBtn" data-idx="'+i+'">삭제</button></td></tr>';
+      }).join('')+
+    '</tbody></table></div>' : '')+
+    '<div class="btn-row" style="align-items:center;">'+
+      '<input type="date" id="pgHoldDate" placeholder="보류일" title="보류일">'+
+      '<input type="date" id="pgHoldReleaseDate" placeholder="보류해제일" title="보류해제일">'+
+      '<input type="number" id="pgHoldAmount" placeholder="보류금액" style="width:120px;" title="보류금액">'+
+      '<button class="btn small" id="pgHoldAddBtn">추가</button>'+
+    '</div>'+
+  '</div>';
+
   var bulkApplyHtml = vanRows.length ? '<div class="btn-row" style="align-items:center;margin-bottom:8px;">'+
     '<label style="font-size:12.5px;display:flex;align-items:center;gap:5px;"><input type="checkbox" id="vanSelectAll">전체 선택</label>'+
     '<input type="date" id="vanBulkDate" style="padding:5px 8px;border-radius:6px;border:1px solid var(--line-strong);font-size:13px;">'+
@@ -3844,25 +3906,32 @@ function renderDepositEntryView(wrap, loaded){
         : '⚠️ PG 승인번호 기준 불일치 '+pgMismatches+'건 (건별 내역에서 확인 필요)')+
     '</div>' : '';
 
+  var pgRowsArr = apKeys.sort(function(a,b){ return apGroups[a].closeDate<apGroups[b].closeDate?-1:1; }).map(function(k){ return apGroups[k]; });
+  var pgSelectBarHtml = pgRowsArr.length ? '<div class="btn-row" style="align-items:center;margin:8px 0;">'+
+      '<label style="font-size:12.5px;display:flex;align-items:center;gap:5px;"><input type="checkbox" id="pgSelectAll">전체 선택</label>'+
+    '</div>'+
+    '<div id="pgCheckSummary-'+bizKey+'" style="margin-bottom:8px;"></div>' : '';
   var pgDetailHtml = '<details data-persist-id="pgDetail-'+bizKey+'"'+detailsOpenAttr('pgDetail-'+bizKey)+' style="margin-top:14px;"><summary class="section-title" style="font-size:12.5px;display:inline;cursor:pointer;">PG 건별 내역(마감일자=거래일자, 정산일자 기준으로 전표 작성 · 예입일자 직접 수정 가능) — 클릭해서 펼치기/접기</summary>'+
+    pgSelectBarHtml +
     '<div class="tableWrap" style="margin-top:6px;"><table class="detailTable"><thead><tr>'+
-      '<th>거래일자(마감)</th><th>정산일자</th><th>승인번호</th><th>정산금액(입금액)</th><th>수수료</th><th>거래금액</th><th>매출전표 승인금액</th><th style="text-align:left">예입일자</th>'+
+      '<th></th><th>거래일자(마감)</th><th>정산일자</th><th>승인번호</th><th>정산금액(입금액)</th><th>수수료</th><th>거래금액</th><th>매출전표 승인금액</th><th style="text-align:left">예입일자</th>'+
     '</tr></thead><tbody>'+
-    (apKeys.length ? apKeys.sort(function(a,b){ return apGroups[a].closeDate<apGroups[b].closeDate?-1:1; }).map(function(k){
-      var g = apGroups[k];
+    (pgRowsArr.length ? pgRowsArr.map(function(g, idx){
       var overrideKey = g.closeDate+'|'+g.approvalNo;
       var overrideVal = (state.biz[bizKey].pgDepositOverrides||{})[overrideKey];
-      return '<tr'+(g.mismatch?' style="background:var(--bad-soft)"':'')+'><td>'+g.closeDate+'</td><td>'+(g.rawSettleDate||g.settleDate)+'</td><td>'+esc(g.approvalNo)+'</td>'+
+      return '<tr'+(g.mismatch?' style="background:var(--bad-soft)"':'')+'>'+
+        '<td style="text-align:center"><input type="checkbox" class="pgSelectChk" data-idx="'+idx+'"></td>'+
+        '<td>'+g.closeDate+'</td><td>'+(g.rawSettleDate||g.settleDate)+'</td><td>'+esc(g.approvalNo)+'</td>'+
         '<td class="num">'+fmt(g.depositAmt)+'</td><td class="num">'+fmt(g.fees)+'</td><td class="num">'+fmt(g.txAmt)+'</td>'+
         '<td class="num">'+fmt(g.salesSum)+'</td>'+
         '<td style="text-align:left"><input type="date" class="pgDepositOverrideInput" style="'+(overrideVal?'border-color:var(--accent);color:var(--accent);':'')+'" data-closedate="'+g.closeDate+'" data-apno="'+esc(g.approvalNo)+'" value="'+(overrideVal||g.settleDate||'')+'"></td></tr>';
-    }).join('') : '<tr><td colspan="8" style="text-align:center;color:var(--ink-soft)">해당 기간 PG 마감내역 없음</td></tr>')+
+    }).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--ink-soft)">해당 기간 PG 마감내역 없음</td></tr>')+
     '</tbody></table></div>'+
     '</details>';
 
   var cardHtml = '<div class="card"><div class="section-title">신용카드 예입<span class="badge">'+depositScopeLabel(f)+'</span></div>'+
     '<div class="hint">카드사별(VAN, O열 기준) 줄 + PG 한 줄로 합쳐서 표시됩니다. VAN 수수료율은 카드명(N열) 기준 매칭, 특이 건은 아래 건별 표에서 직접 수정 가능합니다. 입금일자는 건별로 다를 수 있어 아래 건별 표에서 입력·수정하고, 여러 건이 같은 날이면 체크박스로 선택해 한번에 적용할 수 있습니다. 마이너스 건에 체크하면 입금취소로 처리되어 매출전표 환불내역으로 이동합니다.</div>'+
-    cardSummaryHtml + apMismatchHtml + pgDetailHtml +
+    cardSummaryHtml + pgHoldsHtml + apMismatchHtml + pgDetailHtml +
     '<details data-persist-id="vanDetail-'+bizKey+'"'+detailsOpenAttr('vanDetail-'+bizKey)+' style="margin-top:14px;"><summary class="section-title" style="font-size:12.5px;display:inline;cursor:pointer;">VAN 건별 내역 — 클릭해서 펼치기/접기</summary>'+
     '<div style="margin-top:6px;">'+bulkApplyHtml + vanDetailHtml + '</div></details></div>';
 
@@ -3908,6 +3977,44 @@ function renderDepositEntryView(wrap, loaded){
       });
     });
   });
+  function updatePgCheckSummary(){
+    var el = document.getElementById('pgCheckSummary-'+bizKey);
+    if(!el) return;
+    var checked = Array.prototype.filter.call(wrap.querySelectorAll('.pgSelectChk'), function(c){ return c.checked; });
+    if(!checked.length){ el.innerHTML=''; return; }
+    var byDate = {}, grandCount=0, grandTx=0, grandFee=0, grandDeposit=0;
+    checked.forEach(function(chk){
+      var g = pgRowsArr[Number(chk.getAttribute('data-idx'))];
+      if(!g) return;
+      var dateInput = wrap.querySelector('.pgDepositOverrideInput[data-closedate="'+CSS.escape(g.closeDate)+'"][data-apno="'+CSS.escape(g.approvalNo)+'"]');
+      var effDate = dateInput ? dateInput.value : (g.rawSettleDate||g.settleDate);
+      var b = byDate[effDate] = byDate[effDate] || {count:0, tx:0, fee:0, deposit:0};
+      b.count++; b.tx += g.txAmt; b.fee += g.fees; b.deposit += g.depositAmt;
+      grandCount++; grandTx += g.txAmt; grandFee += g.fees; grandDeposit += g.depositAmt;
+    });
+    var dates = Object.keys(byDate).sort();
+    el.innerHTML = '<div class="tableWrap"><table class="summaryTable"><thead><tr>'+
+        '<th style="text-align:left">예입일자</th><th>건수</th><th>거래금액</th><th>수수료</th><th>정산금액(입금액)</th>'+
+      '</tr></thead><tbody>'+
+      dates.map(function(d){
+        var b = byDate[d];
+        return '<tr><td style="text-align:left">'+esc(d)+'</td><td class="num">'+b.count+'</td><td class="num">'+fmt(b.tx)+'</td>'+
+          '<td class="num">'+fmt(b.fee)+'</td><td class="num">'+fmt(b.deposit)+'</td></tr>';
+      }).join('')+
+      '<tr style="font-weight:700;background:#f3f4f6;"><td style="text-align:left">선택 합계</td><td class="num">'+grandCount+'</td><td class="num">'+fmt(grandTx)+'</td>'+
+        '<td class="num">'+fmt(grandFee)+'</td><td class="num">'+fmt(grandDeposit)+'</td></tr>'+
+      '</tbody></table></div>';
+  }
+  Array.prototype.forEach.call(wrap.querySelectorAll('.pgSelectChk'), function(chk){
+    chk.addEventListener('change', updatePgCheckSummary);
+  });
+  var pgSelectAll = document.getElementById('pgSelectAll');
+  if(pgSelectAll){
+    pgSelectAll.addEventListener('change', function(){
+      Array.prototype.forEach.call(wrap.querySelectorAll('.pgSelectChk'), function(chk){ chk.checked = pgSelectAll.checked; });
+      updatePgCheckSummary();
+    });
+  }
   var vanSelectAll = document.getElementById('vanSelectAll');
   if(vanSelectAll){
     vanSelectAll.addEventListener('change', function(){
@@ -4028,6 +4135,25 @@ function renderDepositEntryView(wrap, loaded){
       applyCancelFlag(inp.getAttribute('data-date'), inp.getAttribute('data-apno'), sibling?sibling.checked:hasValue, inp.value.trim());
     });
   });
+  var pgHoldAddBtn = document.getElementById('pgHoldAddBtn');
+  if(pgHoldAddBtn){
+    pgHoldAddBtn.addEventListener('click', function(){
+      var holdDate = document.getElementById('pgHoldDate').value;
+      var releaseDate = document.getElementById('pgHoldReleaseDate').value;
+      var amount = Number(document.getElementById('pgHoldAmount').value);
+      if(!holdDate || !releaseDate || !amount){ toast('보류일·보류해제일·보류금액을 모두 입력해주세요.'); return; }
+      state.biz[bizKey].pgHolds = state.biz[bizKey].pgHolds || [];
+      state.biz[bizKey].pgHolds.push({holdDate:holdDate, releaseDate:releaseDate, amount:amount});
+      savePgHolds(bizKey).then(function(){ toast('정산보류금액을 추가했습니다.'); renderDepositPage(); });
+    });
+  }
+  Array.prototype.forEach.call(wrap.querySelectorAll('.pgHoldDelBtn'), function(btn){
+    btn.addEventListener('click', function(){
+      var idx = Number(btn.getAttribute('data-idx'));
+      state.biz[bizKey].pgHolds.splice(idx, 1);
+      savePgHolds(bizKey).then(function(){ toast('삭제했습니다.'); renderDepositPage(); });
+    });
+  });
   bindDetailsToggle(wrap);
 }
 
@@ -4092,13 +4218,19 @@ function depositVoucherCardRows(bizKey, vf){
     var g = apGroups[key] = apGroups[key] || {settleDate:r.settleDate, closeDate:r.closeDate, depositAmt:0, fees:0};
     g.depositAmt += r.depositAmt; g.fees += r.fees;
   });
+  var pgSettleSummary = cardPgSettleDateSummary(bizKey); // 마이너스 이월 + 보류금액 반영된 "실제 인식" 금액(정산일자별)
+  var seenSettleDates = {};
   Object.keys(apGroups).forEach(function(k){
     var g = apGroups[k]; var d = g.settleDate; if(!d) return;
     var key = d+'|PG';
     var e = byKey[key] = byKey[key] || {date:d, label:'PG', tx:0, fee:0, deposit:0, breakdown:{}};
-    e.tx += g.depositAmt+g.fees; e.fee += g.fees; e.deposit += g.depositAmt;
+    if(!seenSettleDates[d]){
+      seenSettleDates[d] = true;
+      var recognized = pgSettleSummary[d] || {recognizedDeposit:0, fees:0, txAmt:0};
+      e.tx += recognized.txAmt; e.fee += recognized.fees; e.deposit += recognized.recognizedDeposit;
+    }
     var b = e.breakdown[g.closeDate] = e.breakdown[g.closeDate] || {txDate:g.closeDate, tx:0, fee:0, deposit:0};
-    b.tx += g.depositAmt+g.fees; b.fee += g.fees; b.deposit += g.depositAmt;
+    b.tx += g.depositAmt+g.fees; b.fee += g.fees; b.deposit += g.depositAmt; // breakdown은 참고용 원본 그대로(이월 반영 전)
   });
   return Object.keys(byKey).map(function(k){
     var row = byKey[k];
