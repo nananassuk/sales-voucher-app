@@ -3430,13 +3430,13 @@ function vaVanRecordsInScope(bizKey, f){
 /* =================== 세금계산서전표(거래일자=마감일자 기준, PG 전용) =================== */
 function pgTaxInvoiceSummary(scoped, refDate){
   var today = refDate || todayDateStr();
-  var txAmt=0, fees=0, deposited=0, unpaid=0;
+  var txAmt=0, fees=0, deposited=0, unpaid=0, unpaidFees=0;
   scoped.forEach(function(r){
     txAmt += r.txAmt; fees += r.fees;
     if(r.settleDate && r.settleDate<=today) deposited += r.depositAmt;
-    else unpaid += r.depositAmt;
+    else { unpaid += r.depositAmt; unpaidFees += r.fees; }
   });
-  return {count:scoped.length, txAmt:txAmt, fees:fees, deposited:deposited, unpaid:unpaid};
+  return {count:scoped.length, txAmt:txAmt, fees:fees, deposited:deposited, unpaid:unpaid, unpaidFees:unpaidFees};
 }
 function taxInvoiceScopeLabel(f){
   if(f.mode==='all') return '전체기간';
@@ -3499,6 +3499,7 @@ function renderTaxInvoicePage(){
       '<div class="chip">수수료<b class="num">'+fmt(s.fees)+'</b></div>'+
       '<div class="chip" style="border-left-color:var(--good);">입금액(정산일자≤기준일)<b class="num">'+fmt(s.deposited)+'</b></div>'+
       '<div class="chip" style="border-left-color:var(--bad);">미지급금(정산일자&gt;기준일)<b class="num">'+fmt(s.unpaid)+'</b></div>'+
+      '<div class="chip" style="border-left-color:var(--bad);">미지급금 수수료<b class="num">'+fmt(s.unpaidFees)+'</b></div>'+
     '</div>';
     var rows = scoped.slice().sort(function(a,b){ return a.closeDate<b.closeDate?-1:(a.closeDate>b.closeDate?1:(a.approvalNo<b.approvalNo?-1:1)); });
     var detailHtml = '<details data-persist-id="'+idPrefix+'-'+bizKey+'"'+detailsOpenAttr(idPrefix+'-'+bizKey)+' style="margin-top:10px;">'+
