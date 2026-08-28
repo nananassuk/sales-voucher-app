@@ -1801,7 +1801,19 @@ function combinedPgSettleDateSummary(bizKey){
     };
     carry = effective < 0 ? effective : 0;
   });
-  return result; // settleDate -> {recognizedDeposit, rawVa, rawCard, rawTotal, feesVa, feesCard, txVa, txCard, holdOut, holdIn, carriedIn}
+  // 실제 정산일(resolvedDate): 마이너스로 밀린 날짜는 실제로 플러스로 전환되어 인식되는 날짜를 가리키게 한다.
+  // (뒤에서부터 훑으며, 아직 해결 안 된 날짜엔 다음에 찾은 해결일을 그대로 물려준다)
+  var pendingResolveDate = null;
+  for(var i=dates.length-1; i>=0; i--){
+    var d2 = dates[i];
+    if(result[d2].recognizedDeposit > 0){
+      result[d2].resolvedDate = d2;
+      pendingResolveDate = d2;
+    } else {
+      result[d2].resolvedDate = pendingResolveDate; // null이면 아직 미해결(향후 데이터待)
+    }
+  }
+  return result; // settleDate -> {recognizedDeposit, rawVa, rawCard, rawTotal, feesVa, feesCard, txVa, txCard, holdOut, holdIn, carriedIn, resolvedDate}
 }
 function loadPgHolds(bizKey){
   return storageAdapter.get('pgHolds:'+bizKey).then(function(r){
@@ -3654,15 +3666,8 @@ function renderDepositPage(){
 
 /* =================== 입력 모드(승인일자 기준, 사업장별) =================== */
 function renderPgHoldsManagerView(wrap, tabsHtml, loaded){
-  if(!state.deposit.holdsManagerBiz || loaded.indexOf(state.deposit.holdsManagerBiz)<0) state.deposit.holdsManagerBiz = loaded[0];
-  var bizKey = state.deposit.holdsManagerBiz;
   if(!state.deposit.holdsManagerMonth) state.deposit.holdsManagerMonth = todayDateStr().slice(0,7);
   var month = state.deposit.holdsManagerMonth;
-
-  var bizSelectHtml = '<div class="bizTabs no-print" style="margin-top:8px;">' + loaded.map(function(k){
-    var active = k===bizKey ? ' active' : '';
-    return '<button class="'+active.trim()+'" data-hbiz="'+k+'">'+BIZ[k].label+'</button>';
-  }).join('') + '</div>';
 
   var monthToolbarHtml = '<div class="toolbar no-print">'+
     '<div class="left">'+
@@ -3672,28 +3677,37 @@ function renderPgHoldsManagerView(wrap, tabsHtml, loaded){
     '</div>'+
   '</div>';
 
-  var allHoldsForBiz = state.biz[bizKey].pgHolds || [];
-  var holds = allHoldsForBiz.filter(function(h){ return h.holdDate && h.holdDate.slice(0,7)===month; })
-    .sort(function(a,b){ return a.holdDate<b.holdDate?-1:1; });
+  // 매출전표 취합탭처럼 모든 사업장을 한 화면에 모아서 보여준다(사업장은 행마다 표시, 탭으로 안 나눔)
+  var allRows = []; // {bizKey, idx(그 biz의 pgHolds 배열 내 인덱스), ...hold}
+  loaded.forEach(function(bizKey){
+    (state.biz[bizKey].pgHolds||[]).forEach(function(h, idx){
+      if(h.holdDate && h.holdDate.slice(0,7)===month) allRows.push({bizKey:bizKey, idx:idx, h:h});
+    });
+  });
+  allRows.sort(function(a,b){ return a.h.holdDate<b.h.holdDate?-1:(a.h.holdDate>b.h.holdDate?1:0); });
 
   var tableHtml = '<div class="card">'+
-    '<div class="section-title">정산보류금액 관리<span class="badge">'+BIZ[bizKey].label+' · '+month+'</span></div>'+
-    '<div class="hint">신용카드(PG) 매출 취소가 몰리면 PG사가 정산금액 일부를 보류했다가 나중에 몰아서 풀어주는 경우가 있어요. 여기 등록해두면 예입전표 전표작성(취합·예입일자 기준)의 PG 합계에 자동 반영됩니다(수수료는 따로 계산하지 않고 금액 그대로 빼고 더해집니다). 보류해제일을 아직 모르면 비워두셔도 되고, 나중에 확인되면 그때 입력하시면 그 시점부터 자동 반영돼요. 한번 정확히 입력해두면 계속 유지되는 값이라, 거래일자·입금일자 조회 화면과 헷갈리지 않게 이 화면에서 월별로 따로 관리합니다.</div>'+
-    (holds.length ? '<div class="tableWrap" style="margin:10px 0;"><table class="summaryTable"><thead><tr>'+
-      '<th style="text-align:left">보류일</th><th style="text-align:left">보류해제일</th><th>보류금액</th><th></th>'+
+    '<div class="section-title">정산보류금액 관리<span class="badge">'+month+' · 전체 사업장</span></div>'+
+    '<div class="hint">신용카드(PG) 매출 취소가 몰리면 PG사가 정산금액 일부를 보류했다가 나중에 몰아서 풀어주는 경우가 있어요. 여기 등록해두면 예입전표 전표작성(취합·예입일자 기준)의 PG 합계에 자동 반영됩니다(수수료는 따로 계산하지 않고 금액 그대로 빼고 더해집니다). 보류해제일을 아직 모르면 비워두셔도 되고, 나중에 확인되면 그때 입력하시면 그 시점부터 자동 반영돼요.</div>'+
+    (allRows.length ? '<div class="tableWrap" style="margin:10px 0;"><table class="summaryTable"><thead><tr>'+
+      '<th style="text-align:left">사업장</th><th style="text-align:left">보류일</th><th style="text-align:left">보류해제일</th><th>보류금액</th><th></th>'+
     '</tr></thead><tbody>'+
-      holds.map(function(h){
-        var idx = allHoldsForBiz.indexOf(h);
+      allRows.map(function(row){
+        var h = row.h;
         var unresolved = !h.releaseDate;
-        return '<tr'+(unresolved?' style="background:var(--bad-soft)"':'')+'><td style="text-align:left">'+h.holdDate+'</td>'+
+        return '<tr'+(unresolved?' style="background:var(--bad-soft)"':'')+'>'+
+          '<td style="text-align:left">'+BIZ[row.bizKey].label+'</td>'+
+          '<td style="text-align:left">'+h.holdDate+'</td>'+
           '<td style="text-align:left">'+
-            '<input type="date" class="pgHoldReleaseEdit" data-idx="'+idx+'" value="'+(h.releaseDate||'')+'" style="'+(unresolved?'border-color:var(--bad);':'')+'">'+
+            '<input type="date" class="pgHoldReleaseEdit" data-biz="'+row.bizKey+'" data-idx="'+row.idx+'" value="'+(h.releaseDate||'')+'" style="'+(unresolved?'border-color:var(--bad);':'')+'">'+
             (unresolved ? '<span style="color:var(--bad);font-size:11.5px;margin-left:6px;">⚠ 해제일 미확인(계속 보류 중)</span>' : '')+
           '</td>'+
-          '<td class="num">'+fmt(h.amount)+'</td><td><button class="btn ghost small pgHoldDelBtn2" data-idx="'+idx+'">삭제</button></td></tr>';
+          '<td class="num">'+fmt(h.amount)+'</td>'+
+          '<td><button class="btn ghost small pgHoldDelBtn2" data-biz="'+row.bizKey+'" data-idx="'+row.idx+'">삭제</button></td></tr>';
       }).join('')+
     '</tbody></table></div>' : '<div class="empty" style="padding:20px 0;">이 달에 등록된 보류금액이 없습니다.</div>')+
     '<div class="btn-row" style="align-items:center;">'+
+      '<select id="holdBizSelect">'+loaded.map(function(k){ return '<option value="'+k+'">'+BIZ[k].label+'</option>'; }).join('')+'</select>'+
       '<input type="date" id="holdDate2" title="보류일">'+
       '<input type="date" id="holdReleaseDate2" title="보류해제일(모르면 비워두고 나중에 입력 가능)" placeholder="해제일(모르면 비움)">'+
       '<input type="number" id="holdAmount2" placeholder="보류금액" style="width:120px;" title="보류금액">'+
@@ -3701,14 +3715,11 @@ function renderPgHoldsManagerView(wrap, tabsHtml, loaded){
     '</div>'+
   '</div>';
 
-  wrap.innerHTML = '<div class="stickyBlock">'+tabsHtml+bizSelectHtml+monthToolbarHtml+'</div>'+tableHtml;
+  wrap.innerHTML = '<div class="stickyBlock">'+tabsHtml+monthToolbarHtml+'</div>'+tableHtml;
   syncStickyOffset();
 
   Array.prototype.forEach.call(wrap.querySelectorAll('.bizTabs button[data-dbiz]'), function(btn){
     btn.addEventListener('click', function(){ state.deposit.activeDepositBiz = btn.getAttribute('data-dbiz'); renderDepositPage(); });
-  });
-  Array.prototype.forEach.call(wrap.querySelectorAll('button[data-hbiz]'), function(btn){
-    btn.addEventListener('click', function(){ state.deposit.holdsManagerBiz = btn.getAttribute('data-hbiz'); renderDepositPage(); });
   });
   document.getElementById('holdsMonthPick').addEventListener('change', function(e){ state.deposit.holdsManagerMonth = e.target.value; renderDepositPage(); });
   document.getElementById('holdsMonthPrev').addEventListener('click', function(){
@@ -3722,22 +3733,24 @@ function renderPgHoldsManagerView(wrap, tabsHtml, loaded){
     renderDepositPage();
   });
   document.getElementById('holdAddBtn2').addEventListener('click', function(){
+    var addBizKey = document.getElementById('holdBizSelect').value;
     var holdDate = document.getElementById('holdDate2').value;
     var releaseDate = document.getElementById('holdReleaseDate2').value; // 비워도 됨(나중에 확인되면 입력)
     var amount = Number(document.getElementById('holdAmount2').value);
     if(!holdDate || !amount){ toast('보류일·보류금액을 입력해주세요.'); return; }
-    state.biz[bizKey].pgHolds = state.biz[bizKey].pgHolds || [];
-    state.biz[bizKey].pgHolds.push({holdDate:holdDate, releaseDate:releaseDate||null, amount:amount});
-    savePgHolds(bizKey).then(function(){
+    state.biz[addBizKey].pgHolds = state.biz[addBizKey].pgHolds || [];
+    state.biz[addBizKey].pgHolds.push({holdDate:holdDate, releaseDate:releaseDate||null, amount:amount});
+    savePgHolds(addBizKey).then(function(){
       toast(releaseDate ? '정산보류금액을 추가했습니다.' : '정산보류금액을 추가했습니다(해제일은 나중에 입력해주세요).');
       renderDepositPage();
     });
   });
   Array.prototype.forEach.call(wrap.querySelectorAll('.pgHoldReleaseEdit'), function(inp){
     inp.addEventListener('change', function(){
+      var rBizKey = inp.getAttribute('data-biz');
       var idx = Number(inp.getAttribute('data-idx'));
-      state.biz[bizKey].pgHolds[idx].releaseDate = inp.value || null;
-      savePgHolds(bizKey).then(function(){
+      state.biz[rBizKey].pgHolds[idx].releaseDate = inp.value || null;
+      savePgHolds(rBizKey).then(function(){
         toast(inp.value ? '해제일을 '+inp.value+'로 반영했습니다.' : '해제일을 미확인 상태로 되돌렸습니다.');
         renderDepositPage();
       });
@@ -3745,9 +3758,10 @@ function renderPgHoldsManagerView(wrap, tabsHtml, loaded){
   });
   Array.prototype.forEach.call(wrap.querySelectorAll('.pgHoldDelBtn2'), function(btn){
     btn.addEventListener('click', function(){
+      var dBizKey = btn.getAttribute('data-biz');
       var idx = Number(btn.getAttribute('data-idx'));
-      state.biz[bizKey].pgHolds.splice(idx, 1);
-      savePgHolds(bizKey).then(function(){ toast('삭제했습니다.'); renderDepositPage(); });
+      state.biz[dBizKey].pgHolds.splice(idx, 1);
+      savePgHolds(dBizKey).then(function(){ toast('삭제했습니다.'); renderDepositPage(); });
     });
   });
 }
@@ -4012,21 +4026,28 @@ function renderDepositEntryView(wrap, loaded){
       '<label style="font-size:12.5px;display:flex;align-items:center;gap:5px;"><input type="checkbox" id="pgSelectAll">전체 선택</label>'+
     '</div>'+
     '<div id="pgCheckSummary-'+bizKey+'" style="margin-bottom:8px;"></div>' : '';
+  var pgResolveSummary = combinedPgSettleDateSummary(bizKey); // 마이너스 밀림이 실제로 언제 플러스로 인식되는지(실제 정산일)
   var pgDetailHtml = '<details data-persist-id="pgDetail-'+bizKey+'"'+detailsOpenAttr('pgDetail-'+bizKey)+' style="margin-top:14px;"><summary class="section-title" style="font-size:12.5px;display:inline;cursor:pointer;">PG 건별 내역(마감일자=거래일자, 정산일자 기준으로 전표 작성 · 예입일자 직접 수정 가능) — 클릭해서 펼치기/접기</summary>'+
     pgSelectBarHtml +
     '<div class="tableWrap" style="margin-top:6px;"><table class="detailTable"><thead><tr>'+
-      '<th></th><th>거래일자(마감)</th><th>정산일자</th><th>승인번호</th><th>정산금액(입금액)</th><th>수수료</th><th>거래금액</th><th>매출전표 승인금액</th><th style="text-align:left">예입일자</th>'+
+      '<th></th><th>거래일자(마감)</th><th>정산일자</th><th style="text-align:left">실제 정산일<br><span style="font-weight:400;font-size:10px;color:var(--ink-soft);">(가상계좌+카드 합산, 이월 반영)</span></th><th>승인번호</th><th>정산금액(입금액)</th><th>수수료</th><th>거래금액</th><th>매출전표 승인금액</th><th style="text-align:left">예입일자</th>'+
     '</tr></thead><tbody>'+
     (pgRowsArr.length ? pgRowsArr.map(function(g, idx){
       var overrideKey = g.closeDate+'|'+g.approvalNo;
       var overrideVal = (state.biz[bizKey].pgDepositOverrides||{})[overrideKey];
+      var rawDate = g.rawSettleDate||g.settleDate;
+      var resolveInfo = pgResolveSummary[rawDate];
+      var resolvedDate = resolveInfo ? resolveInfo.resolvedDate : null;
+      var resolvedCell = !resolvedDate ? '<span style="color:var(--bad);">미해결(대기중)</span>'
+        : (resolvedDate===rawDate ? '<span style="color:var(--good);">'+resolvedDate+'</span>'
+        : '<span style="color:var(--bad);font-weight:600;" title="마이너스 정산이 이 날짜로 이월되어 여기서 실제로 입금 인식됨">'+resolvedDate+' (이월)</span>');
       return '<tr'+(g.mismatch?' style="background:var(--bad-soft)"':'')+'>'+
         '<td style="text-align:center"><input type="checkbox" class="pgSelectChk" data-idx="'+idx+'"></td>'+
-        '<td>'+g.closeDate+'</td><td>'+(g.rawSettleDate||g.settleDate)+'</td><td>'+esc(g.approvalNo)+'</td>'+
+        '<td>'+g.closeDate+'</td><td>'+rawDate+'</td><td style="text-align:left">'+resolvedCell+'</td><td>'+esc(g.approvalNo)+'</td>'+
         '<td class="num">'+fmt(g.depositAmt)+'</td><td class="num">'+fmt(g.fees)+'</td><td class="num">'+fmt(g.txAmt)+'</td>'+
         '<td class="num">'+fmt(g.salesSum)+'</td>'+
         '<td style="text-align:left"><input type="date" class="pgDepositOverrideInput" style="'+(overrideVal?'border-color:var(--accent);color:var(--accent);':'')+'" data-closedate="'+g.closeDate+'" data-apno="'+esc(g.approvalNo)+'" value="'+(overrideVal||g.settleDate||'')+'"></td></tr>';
-    }).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--ink-soft)">해당 기간 PG 마감내역 없음</td></tr>')+
+    }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--ink-soft)">해당 기간 PG 마감내역 없음</td></tr>')+
     '</tbody></table></div>'+
     '</details>';
 
