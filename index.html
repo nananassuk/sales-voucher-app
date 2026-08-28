@@ -4070,7 +4070,13 @@ function renderDepositEntryView(wrap, loaded){
     '</div>'+
     '<div id="pgCheckSummary-'+bizKey+'" style="margin-bottom:8px;"></div>' : '';
   var pgResolveSummary = combinedPgSettleDateSummary(bizKey); // 마이너스 밀림이 실제로 언제 플러스로 인식되는지(실제 정산일)
+  var pgOverrideCount = Object.keys(state.biz[bizKey].pgDepositOverrides||{}).length;
+  var pgResetBtnHtml = pgOverrideCount ? '<span style="margin-left:8px;display:inline-flex;align-items:center;gap:4px;">'+
+      '<input type="month" id="pgResetMonth" title="이 정산일자(YYYY-MM)에 해당하는 예입일자 수정건만 초기화">'+
+      '<button class="btn ghost small" id="pgResetOverridesBtn">⚠ 선택 월 예입일자 초기화('+pgOverrideCount+'건 수정됨, 마감내역 기준으로 되돌리기)</button>'+
+    '</span>' : '';
   var pgDetailHtml = '<details data-persist-id="pgDetail-'+bizKey+'"'+detailsOpenAttr('pgDetail-'+bizKey)+' style="margin-top:14px;"><summary class="section-title" style="font-size:12.5px;display:inline;cursor:pointer;">PG 건별 내역(마감일자=거래일자, 정산일자 기준으로 전표 작성 · 예입일자 직접 수정 가능) — 클릭해서 펼치기/접기</summary>'+
+    pgResetBtnHtml +
     pgSelectBarHtml +
     '<div class="tableWrap" style="margin-top:6px;"><table class="detailTable"><thead><tr>'+
       '<th></th><th>거래일자(마감)</th><th>정산일자</th><th style="text-align:left">실제 정산일<br><span style="font-weight:400;font-size:10px;color:var(--ink-soft);">(가상계좌+카드 합산, 이월 반영)</span></th><th>승인번호</th><th>정산금액(입금액)</th><th>수수료</th><th>거래금액</th><th>매출전표 승인금액</th><th style="text-align:left">예입일자</th>'+
@@ -4178,6 +4184,32 @@ function renderDepositEntryView(wrap, loaded){
     pgSelectAll.addEventListener('change', function(){
       Array.prototype.forEach.call(wrap.querySelectorAll('.pgSelectChk'), function(chk){ chk.checked = pgSelectAll.checked; });
       updatePgCheckSummary();
+    });
+  }
+  var pgResetOverridesBtn = document.getElementById('pgResetOverridesBtn');
+  if(pgResetOverridesBtn){
+    pgResetOverridesBtn.addEventListener('click', function(){
+      var targetMonth = document.getElementById('pgResetMonth').value; // YYYY-MM
+      if(!targetMonth){ toast('초기화할 정산일자 월(YYYY-MM)을 먼저 선택해주세요.'); return; }
+      var overrides = state.biz[bizKey].pgDepositOverrides || {};
+      // 오버라이드 키(closeDate|approvalNo)에 매칭되는 실제 카드 마감내역의 "원래 정산일자"가 선택한 월인 것만 골라낸다.
+      var cardByKey = {};
+      state.deposit.card.filter(function(r){ return r.biz===bizKey; }).forEach(function(r){
+        cardByKey[r.closeDate+'|'+r.approvalNo] = r;
+      });
+      var toDelete = Object.keys(overrides).filter(function(k){
+        var rec = cardByKey[k];
+        var rawDate = rec ? (rec.rawSettleDate||rec.settleDate) : null;
+        return rawDate && rawDate.slice(0,7)===targetMonth;
+      });
+      if(!toDelete.length){ toast('정산일자가 '+targetMonth+'인 수정 건이 없습니다.'); return; }
+      if(!confirm(BIZ[bizKey].label+'의 정산일자 '+targetMonth+'에 해당하는 수정된 예입일자 '+toDelete.length+'건을 마감내역 원본으로 되돌립니다. 되돌릴 수 없습니다. 계속할까요?')) return;
+      toDelete.forEach(function(k){ delete overrides[k]; });
+      applyPgDepositOverrides();
+      savePgDepositOverrides(bizKey).then(function(){
+        toast(targetMonth+' 정산일자 건 '+toDelete.length+'개를 초기화했습니다.');
+        renderDepositPage();
+      });
     });
   }
   var vanSelectAll = document.getElementById('vanSelectAll');
