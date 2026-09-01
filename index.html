@@ -1550,13 +1550,8 @@ function expandPartialCardCancellations(bizKey, records){
             transactionDate: r.date, // 카드매출장 매칭(수수료 등)은 원래 거래일자 기준으로 해야 하므로 보존
             __forcedCardCancel: true
           });
-          var remainder = Object.assign({}, r, {
-            id: r.id+'_remainder',
-            card: r.card+grossCancelled, // 나머지는 거래금액 기준 그대로 남아서 정상적으로 수수료가 다시 계산됨
-            items: scaleItemAmounts(r.items, 1-ratio),
-            approvalAmt: r.approvalAmt*(1-ratio)
-          });
-          out.push(cancelPortion, remainder);
+          // 원본 레코드(전체 금액)는 그대로 매출에도 반영되어야 하므로(승인취소 자체가 매출 감소 이벤트) 줄이지 않고 그대로 내보낸다.
+          out.push(cancelPortion, r);
           return;
         }
       }
@@ -2667,7 +2662,9 @@ function partitionRefunds(records, bizKey){
     // "입금취소"로 직접 표시한 건은 상계할 대상이 없는 실제 환불이므로 여기서 제외해 환불로 이동시킴.
     if(r.bank < 0){ r.refundSource = 'bank'; refunds.push(r); return; }
     if(r.__forcedCardCancel){
-      // 부분 입금취소로 미리 분리해둔 조각: 무조건 환불로(입금일자 기준), 원래 거래일자는 transactionDate에 보존됨
+      // 부분 입금취소로 미리 분리해둔 조각: 무조건 환불로(입금일자 기준), 원래 거래일자는 transactionDate에 보존됨.
+      // 원본 거래(전체 금액)는 이 조각과 별개로 매출에도 그대로 반영되어야 하므로(승인취소 자체가 매출 감소 이벤트),
+      // expandPartialCardCancellations에서 원본 레코드를 그대로 같이 내보내 sales로 자연스럽게 흘러들어가게 해둠.
       var pcDepDate = cardCancelDepositDate(bizKey, {approvalNo:r.approvalNo, date:r.transactionDate});
       var pcRefundRec = Object.assign({}, r, {date: pcDepDate || r.transactionDate});
       pcRefundRec.refundSource = 'card_cancel';
@@ -2691,6 +2688,8 @@ function partitionRefunds(records, bizKey){
       });
       refundRec.refundSource = 'card_cancel';
       refunds.push(refundRec);
+      // 승인취소 자체는 매출(그 거래일자)에서도 마이너스로 정상 반영되어야 하므로(넷팅), 원본 레코드도 그대로 매출에 남긴다.
+      sales.push(r);
       return;
     }
     sales.push(r);
