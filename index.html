@@ -2697,9 +2697,11 @@ function partitionRefunds(records, bizKey){
   return {sales:sales, refunds:refunds};
 }
 function cardCancelDepositDate(bizKey, r){
-  var ledgerRec = (state.biz[bizKey].cardLedgerRecords||[]).filter(function(lr){
+  var ledgerRecs = (state.biz[bizKey].cardLedgerRecords||[]).filter(function(lr){
     return lr.approvalNo===String(r.approvalNo||'').trim() && lr.date===r.date;
-  })[0];
+  });
+  // 같은 승인번호로 원거래(+)와 취소거래(-)가 둘 다 잡혀있는 경우가 있어, 금액 부호까지 맞춰서 매칭한다.
+  var ledgerRec = ledgerRecs.filter(function(lr){ return (lr.amount<0) === (r.card<0); })[0] || ledgerRecs[0];
   if(!ledgerRec) return null;
   var byRec = state.biz[bizKey].vanDepositByRecord || {};
   return byRec[ledgerRec.id] || null;
@@ -2707,9 +2709,10 @@ function cardCancelDepositDate(bizKey, r){
 /* 통합매출장 판매 레코드(카드 마이너스 건 등)의 실제 수수료/입금액을 카드매출장 매칭으로 구한다.
    입금취소는 "거래금액"이 아니라 "입금액"(수수료 뺀 순액) 기준으로 처리해야 하므로 필요함. */
 function vanFeeForSalesRecord(bizKey, r){
-  var ledgerRec = (state.biz[bizKey].cardLedgerRecords||[]).filter(function(lr){
+  var ledgerRecs = (state.biz[bizKey].cardLedgerRecords||[]).filter(function(lr){
     return lr.approvalNo===String(r.approvalNo||'').trim() && lr.date===(r.transactionDate||r.date);
-  })[0];
+  });
+  var ledgerRec = ledgerRecs.filter(function(lr){ return (lr.amount<0) === (r.card<0); })[0] || ledgerRecs[0];
   if(!ledgerRec) return null;
   var rateLabel = vanRateGroupLabel(ledgerRec);
   var overrides = state.biz[bizKey].vanFeeOverrides || {};
