@@ -2564,20 +2564,41 @@ function saveAcademicYear(){
   return storageAdapter.set('academicYear', state.academicYear).catch(function(){});
 }
 function filterByScope(records, f, bizKey){
-  // 카드 입금취소로 표시된 건은 거래일자(승인일자)가 아니라 입금일자 기준으로 걸러야 하므로,
-  // 그런 건은 입금일자를 기준일로 삼아 비교한다(입금일자가 아직 없으면 원래 거래일자로 대체).
-  function effectiveDate(r){
+  function matchesDate(d){
+    if(f.mode === 'all') return true;
+    if(f.mode === 'day') return d === f.day;
+    return d >= f.start && d <= f.end;
+  }
+  // 카드입금취소로 표시된 건은 이제 매출(원래 거래일자)에도, 환불(입금일자)에도 각각 따로 나타나야 하므로,
+  // 둘 중 하나라도 지금 보고 있는 기간에 들어오면 일단 포함시킨다(실제 매출/환불 분리는 partitionRefunds가 하고,
+  // 그 결과에서 각자의 날짜가 이 스코프에 맞는지는 호출부에서 다시 한번 걸러준다 - partitionRefundsScoped 참고).
+  return records.filter(function(r){
+    if(matchesDate(r.date)) return true;
     if(r.__forcedCardCancel){
-      return cardCancelDepositDate(bizKey, {approvalNo:r.approvalNo, date:r.transactionDate}) || r.transactionDate;
+      var depDate = cardCancelDepositDate(bizKey, {approvalNo:r.approvalNo, date:r.transactionDate}) || r.transactionDate;
+      return matchesDate(depDate);
     }
     if(bizKey && r.card < 0 && isDepositCancel(bizKey, r.date, r.approvalNo)){
-      return cardCancelDepositDate(bizKey, r) || r.date;
+      var depDate2 = cardCancelDepositDate(bizKey, r) || r.date;
+      return matchesDate(depDate2);
     }
-    return r.date;
+    return false;
+  });
+}
+/* partitionRefunds는 스코프 없이 records 전체를 매출/환불로 나누기만 하므로, 카드입금취소 건처럼
+   매출은 원래 날짜에, 환불은 입금일자에 나타나야 하는 경우 결과의 각 항목이 실제로 지금 스코프(f)에
+   맞는 날짜인지 다시 한번 걸러줘야 한다(그렇지 않으면 다른 날짜의 환불이 이 화면에도 같이 끼어 보임). */
+function partitionRefundsScoped(records, bizKey, f){
+  var part = partitionRefunds(records, bizKey);
+  function matchesDate(d){
+    if(f.mode === 'all') return true;
+    if(f.mode === 'day') return d === f.day;
+    return d >= f.start && d <= f.end;
   }
-  if(f.mode === 'all') return records;
-  if(f.mode === 'day') return records.filter(function(r){ return effectiveDate(r) === f.day; });
-  return records.filter(function(r){ var d = effectiveDate(r); return d >= f.start && d <= f.end; });
+  return {
+    sales: part.sales.filter(function(r){ return matchesDate(r.date); }),
+    refunds: part.refunds.filter(function(r){ return matchesDate(r.date); })
+  };
 }
 function scopeRecords(bizKey){
   var st = state.biz[bizKey];
@@ -2999,7 +3020,7 @@ function renderCombined(wrap, loaded){
   loaded.forEach(function(bizKey){
     var st = state.biz[bizKey];
     var scopedAll = filterByScope(bizRecordsForYear(bizKey), cf, bizKey);
-    var part = partitionRefunds(scopedAll, bizKey);
+    var part = partitionRefundsScoped(scopedAll, bizKey, cf);
     var scoped = part.sales;
     var totals = paymentTotals(scoped);
     grandTotals.va += totals.va; grandTotals.card += totals.card; grandTotals.cash += totals.cash;
@@ -4659,7 +4680,7 @@ function renderResults(){
   var st = state.biz[bizKey];
   var taxed = BIZ[bizKey].taxed;
   var scopedAll = scopeRecords(bizKey);
-  var part = partitionRefunds(scopedAll, bizKey);
+  var part = partitionRefundsScoped(scopedAll, bizKey, st.filter);
   var scoped = part.sales;                 // 매출전표 집계 대상(환불 제외)
   var refunds = part.refunds;
   var totals = paymentTotals(scoped);
@@ -5008,7 +5029,7 @@ function renderResults(){
 function exportExcel(bizKey){
   var st = state.biz[bizKey];
   var taxed = BIZ[bizKey].taxed;
-  var part = partitionRefunds(scopeRecords(bizKey), bizKey);
+  var part = partitionRefundsScoped(scopeRecords(bizKey), bizKey, st.filter);
   var scoped = part.sales;
   var wb = XLSX.utils.book_new();
 
@@ -5066,7 +5087,7 @@ function exportExcel(bizKey){
 }
 
 function exportTaxDetail(bizKey){
-  var scoped = partitionRefunds(scopeRecords(bizKey), bizKey).sales;
+  var scoped = partitionRefundsScoped(scopeRecords(bizKey), bizKey, state.biz[bizKey].filter).sales;
   var aoa = [['결제일자','번호','수험번호','이름','승인번호','승인금액(부가세포함)','과세금액','부가세']];
   scoped.forEach(function(r){
     aoa.push([r.date, r.no, r.examNo, r.name, r.approvalNo, r.approvalAmt, r.taxAmt, r.vat]);
