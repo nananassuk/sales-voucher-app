@@ -681,6 +681,118 @@ function cardFeeForContribution(bizKey, r, cardShare, asOfDate){
   if(rate==null) return {recordKey:'cardvan|'+bizKey+'|'+ledgerRec.id, fee:null};
   return {recordKey:'cardvan|'+bizKey+'|'+ledgerRec.id, fee:roundDownFee(ledgerRec.amount, rate)}; // 예입전표와 동일: 거래 전체 금액 기준, 품목별로 쪼개지 않음
 }
+/* 한 결제 건의 수수료는 그 건에 들어있는 품목들이 "금액 비중대로" 나눠 가져야 한다.
+   (예: 3,931,180원 결제에 수수료 95,134원이면 품목마다 95,134를 반복하는 게 아니라 품목 금액 비율로 쪼갠다)
+   원 단위 정수 수수료는 합이 정확히 원래 수수료가 되도록, 소수점이 큰 품목부터 1원씩 더 배분한다. */
+function allocateRecordFee(fee, shares){
+  var sum = shares.reduce(function(s,x){ return s+x; }, 0);
+  if(!sum) return shares.map(function(){ return 0; });
+  var feeInt = Math.round(fee); // 소수 수수료는 먼저 원 단위로
+  var exact = shares.map(function(x){ return feeInt*x/sum; });
+  var sameSign = shares.every(function(x){ return x===0 || (x>0)===(sum>0); });
+  if(!sameSign){
+    // 부호가 섞인 건: 각각 반올림하고, 어긋난 원 단위는 금액(절댓값)이 가장 큰 품목 하나에 얹어서 합을 맞춘다
+    var parts = exact.map(function(e){ return Math.round(e); });
+    var diff = feeInt - parts.reduce(function(s,x){ return s+x; }, 0);
+    if(diff){
+      var bi = 0;
+      shares.forEach(function(x,i){ if(Math.abs(x) > Math.abs(shares[bi])) bi = i; });
+      parts[bi] += diff;
+    }
+    return parts;
+  }
+  var sign = feeInt<0 ? -1 : 1, absFee = Math.abs(feeInt);
+  var floors = exact.map(function(e){ return Math.floor(Math.abs(e)+1e-9); });
+  var rem = absFee - floors.reduce(function(s,x){ return s+x; }, 0);
+  var order = [];
+  exact.forEach(function(e,i){ if(shares[i]!==0) order.push({i:i, frac:Math.abs(e)-floors[i]}); });
+  order.sort(function(a,b){ return b.frac-a.frac; });
+  for(var k=0; k<rem && k<order.length; k++) floors[order[k].i] += 1;
+  return floors.map(function(x){ return sign*x; });
+}
+/* 선수수익 품목별 수수료 배분표: contribution(결제건×품목) -> {va, card, vaMatched, vaUnmatchedKey}
+   비중 계산은 선택 여부와 상관없이 agg 전체 품목을 기준으로 해야 같은 건이 항상 같은 금액으로 나뉜다. */
+function buildDeferredFeeAlloc(bizKey, agg, vaPgFeeMap, asOfDate){
+  var alloc = new Map();
+  function ensure(c){ var a = alloc.get(c); if(!a){ a = {va:0, card:0, vaMatched:false, vaUnmatchedKey:null, vaKey:null, cardKey:null}; alloc.set(c,a); } return a; }
+  var recMemo = new Map(); // 같은 결제 건(레코드)의 수수료 조회는 한 번만
+  function recFees(rec){
+    var m = recMemo.get(rec);
+    if(!m){
+      m = {va: vaFeeForContribution(bizKey, rec, rec.va, vaPgFeeMap), card: cardFeeForContribution(bizKey, rec, rec.card, asOfDate)};
+      recMemo.set(rec, m);
+    }
+    return m;
+  }
+  var groups = {va:{}, card:{}}; // recordKey -> {fee, entries:[{c, share}]}
+  Object.keys(agg).forEach(function(nm){
+    agg[nm].contributions.forEach(function(c){
+      var m = recFees(c.record);
+      if(m.va && c.vaShare){
+        if(m.va.fee==null){ ensure(c).vaUnmatchedKey = m.va.recordKey; }
+        else {
+          var g = groups.va[m.va.recordKey] = groups.va[m.va.recordKey] || {fee:m.va.fee, entries:[]};
+          g.entries.push({c:c, share:c.vaShare});
+        }
+      }
+      if(m.card && c.cardShare){
+        var g2 = groups.card[m.card.recordKey] = groups.card[m.card.recordKey] || {fee:m.card.fee||0, entries:[]};
+        g2.entries.push({c:c, share:c.cardShare});
+      }
+    });
+  });
+  ['va','card'].forEach(function(kind){
+    Object.keys(groups[kind]).forEach(function(key){
+      var g = groups[kind][key];
+      var parts = allocateRecordFee(g.fee, g.entries.map(function(e){ return e.share; }));
+      g.entries.forEach(function(e,i){
+        var a = ensure(e.c);
+        a[kind] += parts[i];
+        a[kind+'Key'] = key;
+        if(kind==='va') a.vaMatched = true;
+      });
+    });
+  });
+  return alloc;
+}
+function deferredRatioOf(s){
+  return (s && s.allocate && Number(s.totalCount)>0) ? (Number(s.remainCount)||0)/Number(s.totalCount) : 1;
+}
+/* 인정비율(기간배분)까지 곱한 뒤의 최종 수수료를 "원 단위 정수"로 만든다.
+   같은 결제 건(recordKey)에 속한 선택 품목들은 각각 반올림한 합이 건 전체 합(반올림)과 어긋나면,
+   그 어긋난 원 단위를 금액이 가장 큰 품목 하나에 얹어서 합이 항상 맞게 한다. 화면 표와 엑셀이 같은 값을 쓴다. */
+function finalizeDeferredFees(feeAlloc, agg, selectedNames, sel){
+  var fin = new Map(); // contribution -> {va, card}
+  ['va','card'].forEach(function(kind){
+    var shareKey = kind==='va' ? 'vaShare' : 'cardShare';
+    var groups = {}; // recordKey -> [{c, exact, weight}]
+    selectedNames.forEach(function(nm){
+      var ratio = deferredRatioOf(sel[nm]);
+      agg[nm].contributions.forEach(function(c){
+        var a = feeAlloc.get(c);
+        var key = a && a[kind+'Key'];
+        if(!key) return;
+        (groups[key] = groups[key] || []).push({c:c, exact:a[kind]*ratio, weight:Math.abs(c[shareKey]*ratio)});
+      });
+    });
+    Object.keys(groups).forEach(function(key){
+      var es = groups[key];
+      var parts = es.map(function(e){ return Math.round(e.exact); });
+      var target = Math.round(es.reduce(function(s,e){ return s+e.exact; }, 0));
+      var diff = target - parts.reduce(function(s,x){ return s+x; }, 0);
+      if(diff){
+        var bi = 0;
+        es.forEach(function(e,i){ if(e.weight > es[bi].weight) bi = i; });
+        parts[bi] += diff;
+      }
+      es.forEach(function(e,i){
+        var o = fin.get(e.c); if(!o){ o = {va:0, card:0}; fin.set(e.c, o); }
+        o[kind] = parts[i];
+      });
+    });
+  });
+  return fin;
+}
 /* 매출기준일: 그 날짜 "까지"의 모든 거래를 누적 합산(하루/기간 개념이 아님) */
 function deferredScopeRecords(bizKey, asOfDate){
   var recs = bizRecordsForYear(bizKey);
@@ -753,29 +865,23 @@ function renderDeferredPage(){
     '</tbody></table></div></div>';
 
   var selectedNames = itemNames.filter(function(nm){ return sel[nm] && sel[nm].checked; });
-  var globalVaFeeSeen = {}, globalCardFeeSeen = {}; // 여러 품목이 같은 거래를 공유해도 합계에서 중복 계산되지 않도록
+  // 결제 건 하나의 수수료는 품목 금액 비중대로 나눠서 품목별로 배분한다(품목마다 건 전체 수수료가 반복되지 않게)
+  var feeAlloc = selectedNames.length ? buildDeferredFeeAlloc(bizKey, agg, vaPgFeeMap, f.day) : new Map();
+  var feeFin = finalizeDeferredFees(feeAlloc, agg, selectedNames, sel); // 인정비율까지 반영한 원 단위 정수 수수료(합이 항상 맞게 보정)
   var rows = selectedNames.map(function(nm){
     var it = agg[nm];
     var s = sel[nm];
     var ratio = (s.allocate && Number(s.totalCount)>0) ? (Number(s.remainCount)||0)/Number(s.totalCount) : 1;
     var vaFee = 0, cardFee = 0, vaUnmatched = 0;
-    var localVaSeen = {}, localCardSeen = {};
+    var unmatchedSeen = {};
     it.contributions.forEach(function(c){
-      var f1 = vaFeeForContribution(bizKey, c.record, c.vaShare, vaPgFeeMap);
-      if(f1 && !localVaSeen[f1.recordKey]){
-        localVaSeen[f1.recordKey] = true;
-        if(f1.fee==null){ vaUnmatched++; } else { vaFee += f1.fee; }
-      }
-      if(f1 && globalVaFeeSeen[f1.recordKey]===undefined){ globalVaFeeSeen[f1.recordKey] = f1.fee==null ? 0 : f1.fee*ratio; }
-      var f2 = cardFeeForContribution(bizKey, c.record, c.cardShare, f.day);
-      if(f2 && !localCardSeen[f2.recordKey]){
-        localCardSeen[f2.recordKey] = true;
-        cardFee += f2.fee||0;
-      }
-      if(f2 && globalCardFeeSeen[f2.recordKey]===undefined){ globalCardFeeSeen[f2.recordKey] = (f2.fee||0)*ratio; }
+      var a = feeAlloc.get(c);
+      if(!a) return;
+      var fn = feeFin.get(c);
+      if(fn){ vaFee += fn.va; cardFee += fn.card; }
+      if(a.vaUnmatchedKey && !unmatchedSeen[a.vaUnmatchedKey]){ unmatchedSeen[a.vaUnmatchedKey] = true; vaUnmatched++; }
     });
     var vaSales = it.vaSales*ratio, cardSales = it.cardSales*ratio, otherSales = it.otherSales*ratio;
-    vaFee *= ratio; cardFee *= ratio;
     var grossTotal = vaSales+cardSales+otherSales;
     var tax = taxed ? splitTax(grossTotal) : null;
     // 과세사업장(퀀텀2)은 인정매출액을 부가세 제외 과세금액 기준으로 표시(수수료도 원래 과세금액 기준으로 부과되는 것과 동일한 원리)
@@ -783,19 +889,14 @@ function renderDeferredPage(){
     return {itemName:nm, vaSales:vaSales, vaFee:vaFee, cardSales:cardSales, cardFee:cardFee, otherSales:otherSales,
       feeSum:vaFee+cardFee, recognizedTotal:recognizedTotal, ratio:ratio, tax:tax, vaUnmatched:vaUnmatched};
   });
-  // 합계는 품목별 fee를 그냥 더하지 않고, 실제 겹치는 거래(recordKey) 없이 딱 한 번씩만 반영된 값으로 다시 계산
-  // (같은 결제 건에 여러 품목이 섞여 있어도 수수료가 중복 집계되지 않도록, 예입전표와 정확히 같은 총액이 나오게 함)
-  var dedupedVaFee = Object.keys(globalVaFeeSeen).reduce(function(s,k){ return s+(globalVaFeeSeen[k]||0); }, 0);
-  var dedupedCardFee = Object.keys(globalCardFeeSeen).reduce(function(s,k){ return s+(globalCardFeeSeen[k]||0); }, 0);
+  // 수수료가 품목별로 쪼개져 있으므로 합계는 선택된 품목 행의 합 그대로(전부 선택하면 예입전표 수수료 총액과 같아짐)
   var grand = rows.reduce(function(a,r){
     a.vaSales+=r.vaSales; a.cardSales+=r.cardSales; a.otherSales+=r.otherSales;
+    a.vaFee+=r.vaFee; a.cardFee+=r.cardFee; a.feeSum+=r.feeSum;
     a.recognizedTotal+=r.recognizedTotal; a.vaUnmatched+=r.vaUnmatched;
     if(taxed){ a.taxAmt+=r.tax.taxAmt; a.vat+=r.tax.vat; }
     return a;
   }, {vaSales:0,vaFee:0,cardSales:0,cardFee:0,otherSales:0,feeSum:0,recognizedTotal:0,taxAmt:0,vat:0,vaUnmatched:0});
-  grand.vaFee = dedupedVaFee;
-  grand.cardFee = dedupedCardFee;
-  grand.feeSum = dedupedVaFee + dedupedCardFee;
 
   var chipDefs = [
     {cls:'va', label:'가상계좌 매출', val:grand.vaSales},
@@ -884,22 +985,23 @@ function exportDeferredDetail(bizKey, selectedNames, agg, sel, taxed, vaPgFeeMap
   var aoa = [['품목명','결제일자','이름','수험번호','승인번호/이체자','PG구분','기간배분','총횟수','잔여횟수','인정비율(%)',
     '가상계좌매출분(인정비율 적용)','가상계좌수수료분(인정비율 적용)','카드매출분(인정비율 적용)','카드수수료분(인정비율 적용)','현금·은행매출분(인정비율 적용)','건별 합계(인정비율 적용)']];
   var grandCheck = 0;
+  var feeAlloc = buildDeferredFeeAlloc(bizKey, agg, vaPgFeeMap, asOfDate); // 화면 표와 같은 품목별 수수료 배분
+  var feeFin = finalizeDeferredFees(feeAlloc, agg, selectedNames, sel);
   selectedNames.forEach(function(nm){
     var s = sel[nm];
     var ratio = (s.allocate && Number(s.totalCount)>0) ? (Number(s.remainCount)||0)/Number(s.totalCount) : 1;
     var ratioPct = s.allocate ? Math.round(ratio*100) : 100;
     agg[nm].contributions.forEach(function(c){
       var r = c.record;
-      var f1 = vaFeeForContribution(bizKey, r, c.vaShare, vaPgFeeMap);
-      var vaFeeRaw = f1 ? f1.fee : null;
-      var vaFee = (vaFeeRaw==null ? 0 : vaFeeRaw) * ratio;
-      var f2 = cardFeeForContribution(bizKey, r, c.cardShare, asOfDate);
-      var cardFee = (f2 && f2.fee!=null ? f2.fee : 0) * ratio;
+      var a = feeAlloc.get(c);
+      var fn = feeFin.get(c);
+      var vaFee = fn ? fn.va : 0;
+      var cardFee = fn ? fn.card : 0;
       var vaAmt = Math.round(c.vaShare*ratio), cardAmt = Math.round(c.cardShare*ratio), otherAmt = Math.round((c.otherShare||0)*ratio);
       grandCheck += vaAmt+cardAmt+otherAmt;
       aoa.push([nm, r.date, r.name, r.examNo, r.approvalNo||r.name, r.pg||'',
         s.allocate?'Y':'N', s.allocate?s.totalCount:'', s.allocate?s.remainCount:'', ratioPct,
-        vaAmt, vaFeeRaw==null?'매칭안됨':Math.round(vaFee), cardAmt, Math.round(cardFee), otherAmt, vaAmt+cardAmt+otherAmt]);
+        vaAmt, (a && a.vaMatched)?Math.round(vaFee):'매칭안됨', cardAmt, Math.round(cardFee), otherAmt, vaAmt+cardAmt+otherAmt]);
     });
   });
   aoa.push(['합계','','','','','','','','','','','','','','', grandCheck]);
