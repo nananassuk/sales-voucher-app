@@ -633,11 +633,16 @@ function buildVaPgFeeMap(bizKey, asOfDate){
   });
   return map;
 }
-function vaFeeForContribution(bizKey, r, vaShare, vaPgFeeMap){
+function vaFeeForContribution(bizKey, r, vaShare, vaPgFeeMap, asOfDate){
   if(!vaShare || !r.va) return null;
   var pg = String(r.pg||'').toUpperCase();
   var recordKey = 'va|'+bizKey+'|'+r.date+'|'+r.no+'|'+r.examNo+'|'+r.name;
-  if(pg==='VAN') return {recordKey:recordKey, fee:275}; // 예입전표와 동일: 건당 275원 고정, 품목별로 쪼개지 않음
+  if(pg==='VAN'){
+    // 수수료는 정산(예입)일자 기준으로 인식: 결제는 매출기준일 이전이어도 예입일자가 기준일 이후면 수수료 0(명단엔 그대로 나옴)
+    var vanDep = state.deposit.vaVanDepositDates[bizKey+'|'+r.date];
+    if(asOfDate && vanDep && vanDep > asOfDate) return {recordKey:recordKey, fee:0};
+    return {recordKey:recordKey, fee:275}; // 예입전표와 동일: 건당 275원 고정, 품목별로 쪼개지 않음
+  }
   var key = r.date+'|'+r.no+'|'+r.examNo+'|'+r.name;
   var e = vaPgFeeMap[key];
   if(!e) return {recordKey:recordKey, fee:null}; // 매칭 안 됨 -> 계산 불가(추정하지 않음)
@@ -672,14 +677,24 @@ function cardFeeForContribution(bizKey, r, cardShare, asOfDate){
     if(!g.total) return null;
     return {recordKey:'cardpg|'+bizKey+'|'+groupKey, fee:g.fees}; // 예입전표와 동일: 승인번호 그룹 전체 수수료를 그대로 사용
   }
-  var ledgerRec = (state.biz[bizKey].cardLedgerRecords||[]).filter(function(lr){ return lr.approvalNo===String(r.approvalNo||'').trim() && lr.date===r.date; })[0];
+  var ledgerRec = findVanLedgerRec(bizKey, r);
   if(!ledgerRec) return null;
+  var vanRecordKey = 'cardvan|'+bizKey+'|'+ledgerRec.id;
+  // 수수료는 정산(예입)일자 기준으로 인식: 결제는 매출기준일 이전이어도 예입일자가 기준일 이후면 수수료 0(명단엔 그대로 나옴)
+  var vanDepDate = (state.biz[bizKey].vanDepositByRecord||{})[ledgerRec.id];
+  if(asOfDate && vanDepDate && vanDepDate > asOfDate) return {recordKey:vanRecordKey, fee:0};
   var rateLabel = vanRateGroupLabel(ledgerRec);
   var overrides = state.biz[bizKey].vanFeeOverrides || {};
   var overrideRate = overrides[ledgerRec.id];
   var rate = (overrideRate!=null && overrideRate!=='') ? Number(overrideRate) : effectiveFeeRate(bizKey, rateLabel, r.date);
-  if(rate==null) return {recordKey:'cardvan|'+bizKey+'|'+ledgerRec.id, fee:null};
-  return {recordKey:'cardvan|'+bizKey+'|'+ledgerRec.id, fee:roundDownFee(ledgerRec.amount, rate)}; // 예입전표와 동일: 거래 전체 금액 기준, 품목별로 쪼개지 않음
+  if(rate==null) return {recordKey:vanRecordKey, fee:null};
+  return {recordKey:vanRecordKey, fee:roundDownFee(ledgerRec.amount, rate)}; // 예입전표와 동일: 거래 전체 금액 기준, 품목별로 쪼개지 않음
+}
+/* 통합매출장 레코드에 대응하는 카드매출장(VAN) 건. 같은 승인번호로 원거래(+)와 취소(-)가 같이 있을 수 있어 금액 부호까지 맞춘다. */
+function findVanLedgerRec(bizKey, r){
+  var ap = String(r.approvalNo||'').trim();
+  var recs = (state.biz[bizKey].cardLedgerRecords||[]).filter(function(lr){ return lr.approvalNo===ap && lr.date===r.date; });
+  return recs.filter(function(lr){ return (lr.amount<0)===(r.card<0); })[0] || recs[0] || null;
 }
 /* 한 결제 건의 수수료는 그 건에 들어있는 품목들이 "금액 비중대로" 나눠 가져야 한다.
    (예: 3,931,180원 결제에 수수료 95,134원이면 품목마다 95,134를 반복하는 게 아니라 품목 금액 비율로 쪼갠다)
@@ -719,7 +734,7 @@ function buildDeferredFeeAlloc(bizKey, agg, vaPgFeeMap, asOfDate){
   function recFees(rec){
     var m = recMemo.get(rec);
     if(!m){
-      m = {va: vaFeeForContribution(bizKey, rec, rec.va, vaPgFeeMap), card: cardFeeForContribution(bizKey, rec, rec.card, asOfDate)};
+      m = {va: vaFeeForContribution(bizKey, rec, rec.va, vaPgFeeMap, asOfDate), card: cardFeeForContribution(bizKey, rec, rec.card, asOfDate)};
       recMemo.set(rec, m);
     }
     return m;
@@ -979,14 +994,56 @@ function renderDeferredPage(){
   document.getElementById('dfExportBtn').addEventListener('click', function(){ exportDeferredDetail(bizKey, selectedNames, agg, sel, taxed, vaPgFeeMap, f.day); });
 }
 
+/* 선수수익 세부내역용: 결제 건의 예입일자(정산일자). PG는 마감내역, VAN은 예입전표에서 입력한 예입일자를 쓴다.
+   아직 정산 내역이 없으면 PG는 "미정산", VAN은 "미입력"으로 표시한다. */
+function buildSettleDateIndex(bizKey){
+  var card = {}, va = {};
+  state.deposit.card.forEach(function(cr){
+    if(cr.biz!==bizKey || !cr.settleDate) return;
+    var k = cr.closeDate+'|'+String(cr.approvalNo||'').trim();
+    (card[k] = card[k] || {})[cr.settleDate] = 1;
+  });
+  state.deposit.va.forEach(function(vr){
+    if(vr.biz!==bizKey || !vr.settleDate) return;
+    var k = vr.closeDate+'|'+String(vr.orderer||'').trim();
+    (va[k] = va[k] || {})[vr.settleDate] = 1;
+  });
+  return {card:card, va:va};
+}
+function deferredSettleDateText(bizKey, c, idx){
+  var r = c.record, isPg = String(r.pg||'').toUpperCase()==='PG';
+  var parts = [];
+  function add(dates, missingLabel){ parts.push(dates && dates.length ? dates.join(', ') : missingLabel); }
+  if(c.cardShare){
+    if(isPg){
+      var m = idx.card[r.date+'|'+String(r.approvalNo||'').trim()];
+      add(m ? Object.keys(m).sort() : null, '미정산');
+    } else {
+      var lr = findVanLedgerRec(bizKey, r);
+      var d = lr ? (state.biz[bizKey].vanDepositByRecord||{})[lr.id] : null;
+      add(d ? [d] : null, '미입력');
+    }
+  }
+  if(c.vaShare){
+    if(isPg){
+      var m2 = idx.va[r.date+'|'+String(r.name||'').trim()];
+      add(m2 ? Object.keys(m2).sort() : null, '미정산');
+    } else {
+      var d2 = state.deposit.vaVanDepositDates[bizKey+'|'+r.date];
+      add(d2 ? [d2] : null, '미입력');
+    }
+  }
+  return parts.filter(function(x,i){ return parts.indexOf(x)===i; }).join(' / ');
+}
 function exportDeferredDetail(bizKey, selectedNames, agg, sel, taxed, vaPgFeeMap, asOfDate){
   if(!selectedNames.length){ toast('선택된 품목이 없습니다.'); return; }
   var wb = XLSX.utils.book_new();
-  var aoa = [['품목명','결제일자','이름','수험번호','승인번호/이체자','PG구분','기간배분','총횟수','잔여횟수','인정비율(%)',
+  var aoa = [['품목명','결제일자','예입일자(정산일자)','이름','수험번호','승인번호/이체자','PG구분','기간배분','총횟수','잔여횟수','인정비율(%)',
     '가상계좌매출분(인정비율 적용)','가상계좌수수료분(인정비율 적용)','카드매출분(인정비율 적용)','카드수수료분(인정비율 적용)','현금·은행매출분(인정비율 적용)','건별 합계(인정비율 적용)']];
   var grandCheck = 0;
   var feeAlloc = buildDeferredFeeAlloc(bizKey, agg, vaPgFeeMap, asOfDate); // 화면 표와 같은 품목별 수수료 배분
   var feeFin = finalizeDeferredFees(feeAlloc, agg, selectedNames, sel);
+  var settleIdx = buildSettleDateIndex(bizKey);
   selectedNames.forEach(function(nm){
     var s = sel[nm];
     var ratio = (s.allocate && Number(s.totalCount)>0) ? (Number(s.remainCount)||0)/Number(s.totalCount) : 1;
@@ -999,12 +1056,14 @@ function exportDeferredDetail(bizKey, selectedNames, agg, sel, taxed, vaPgFeeMap
       var cardFee = fn ? fn.card : 0;
       var vaAmt = Math.round(c.vaShare*ratio), cardAmt = Math.round(c.cardShare*ratio), otherAmt = Math.round((c.otherShare||0)*ratio);
       grandCheck += vaAmt+cardAmt+otherAmt;
-      aoa.push([nm, r.date, r.name, r.examNo, r.approvalNo||r.name, r.pg||'',
+      aoa.push([nm, r.date, deferredSettleDateText(bizKey, c, settleIdx), r.name, r.examNo, r.approvalNo||r.name, r.pg||'',
         s.allocate?'Y':'N', s.allocate?s.totalCount:'', s.allocate?s.remainCount:'', ratioPct,
         vaAmt, (a && a.vaMatched)?Math.round(vaFee):'매칭안됨', cardAmt, Math.round(cardFee), otherAmt, vaAmt+cardAmt+otherAmt]);
     });
   });
-  aoa.push(['합계','','','','','','','','','','','','','','', grandCheck]);
+  var totalRow = new Array(aoa[0].length).fill('');
+  totalRow[0] = '합계'; totalRow[aoa[0].length-1] = grandCheck;
+  aoa.push(totalRow);
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), '선수수익_세부내역');
   XLSX.writeFile(wb, '선수수익_세부내역_'+BIZ[bizKey].label+'.xlsx');
 }
