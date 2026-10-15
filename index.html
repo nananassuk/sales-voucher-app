@@ -773,6 +773,27 @@ function buildDeferredFeeAlloc(bizKey, agg, vaPgFeeMap, asOfDate){
 function deferredRatioOf(s){
   return (s && s.allocate && Number(s.totalCount)>0) ? (Number(s.remainCount)||0)/Number(s.totalCount) : 1;
 }
+/* 선수수익 건별 금액(인정비율 적용, 원 단위). 화면 표와 엑셀이 같은 값을 쓰도록 한 곳에서 계산한다. */
+function deferredContribAmounts(c, ratio){
+  return {va: Math.round(c.vaShare*ratio), card: Math.round(c.cardShare*ratio), other: Math.round((c.otherShare||0)*ratio)};
+}
+/* 과세사업장(퀀텀2) 세금 분리: 세금계산서는 PG 결제분만 발행되므로 PG는 가상계좌/카드별로 과세금액·부가세로 나누고,
+   VAN·현금·은행은 세금계산서가 없어 부가세 없이 금액 그대로 둔다. 매출전표와 같은 방식(건별 반올림 후 합산)으로 계산한다. */
+function deferredTaxSplit(contributions, ratio){
+  var tx = {vaPgTax:0, vaPgVat:0, vaVan:0, cardPgTax:0, cardPgVat:0, cardVan:0, va:0, card:0, other:0};
+  contributions.forEach(function(c){
+    var amt = deferredContribAmounts(c, ratio);
+    var isPg = String(c.record.pg||'').toUpperCase()==='PG';
+    tx.va += amt.va; tx.card += amt.card; tx.other += amt.other;
+    if(amt.va){
+      if(isPg){ var t1 = splitTax(amt.va); tx.vaPgTax += t1.taxAmt; tx.vaPgVat += t1.vat; } else { tx.vaVan += amt.va; }
+    }
+    if(amt.card){
+      if(isPg){ var t2 = splitTax(amt.card); tx.cardPgTax += t2.taxAmt; tx.cardPgVat += t2.vat; } else { tx.cardVan += amt.card; }
+    }
+  });
+  return tx;
+}
 /* 인정비율(기간배분)까지 곱한 뒤의 최종 수수료를 "원 단위 정수"로 만든다.
    같은 결제 건(recordKey)에 속한 선택 품목들은 각각 반올림한 합이 건 전체 합(반올림)과 어긋나면,
    그 어긋난 원 단위를 금액이 가장 큰 품목 하나에 얹어서 합이 항상 맞게 한다. 화면 표와 엑셀이 같은 값을 쓴다. */
@@ -897,21 +918,27 @@ function renderDeferredPage(){
       if(a.vaUnmatchedKey && !unmatchedSeen[a.vaUnmatchedKey]){ unmatchedSeen[a.vaUnmatchedKey] = true; vaUnmatched++; }
     });
     var vaSales = it.vaSales*ratio, cardSales = it.cardSales*ratio, otherSales = it.otherSales*ratio;
-    var grossTotal = vaSales+cardSales+otherSales;
-    var tax = taxed ? splitTax(grossTotal) : null;
-    // 과세사업장(퀀텀2)은 인정매출액을 부가세 제외 과세금액 기준으로 표시(수수료도 원래 과세금액 기준으로 부과되는 것과 동일한 원리)
-    var recognizedTotal = taxed ? tax.taxAmt : grossTotal;
+    var recognizedTotal = vaSales+cardSales+otherSales;
+    var tx = null;
+    if(taxed){
+      // 퀀텀2: PG는 가상계좌/카드별 과세금액·부가세로 나누고, VAN·현금·은행은 부가세 없이 금액 그대로.
+      // 인정매출액 = PG 과세금액 + VAN·현금·은행 금액. 매출 칸도 엑셀 건별 행과 같은 원 단위 합으로 맞춘다.
+      tx = deferredTaxSplit(it.contributions, ratio);
+      vaSales = tx.va; cardSales = tx.card; otherSales = tx.other;
+      recognizedTotal = tx.vaPgTax + tx.vaVan + tx.cardPgTax + tx.cardVan + tx.other;
+    }
     return {itemName:nm, vaSales:vaSales, vaFee:vaFee, cardSales:cardSales, cardFee:cardFee, otherSales:otherSales,
-      feeSum:vaFee+cardFee, recognizedTotal:recognizedTotal, ratio:ratio, tax:tax, vaUnmatched:vaUnmatched};
+      feeSum:vaFee+cardFee, recognizedTotal:recognizedTotal, ratio:ratio, tx:tx, vaUnmatched:vaUnmatched};
   });
   // 수수료가 품목별로 쪼개져 있으므로 합계는 선택된 품목 행의 합 그대로(전부 선택하면 예입전표 수수료 총액과 같아짐)
   var grand = rows.reduce(function(a,r){
     a.vaSales+=r.vaSales; a.cardSales+=r.cardSales; a.otherSales+=r.otherSales;
     a.vaFee+=r.vaFee; a.cardFee+=r.cardFee; a.feeSum+=r.feeSum;
     a.recognizedTotal+=r.recognizedTotal; a.vaUnmatched+=r.vaUnmatched;
-    if(taxed){ a.taxAmt+=r.tax.taxAmt; a.vat+=r.tax.vat; }
+    if(taxed){ ['vaPgTax','vaPgVat','vaVan','cardPgTax','cardPgVat','cardVan'].forEach(function(k){ a[k]+=r.tx[k]; }); }
     return a;
-  }, {vaSales:0,vaFee:0,cardSales:0,cardFee:0,otherSales:0,feeSum:0,recognizedTotal:0,taxAmt:0,vat:0,vaUnmatched:0});
+  }, {vaSales:0,vaFee:0,cardSales:0,cardFee:0,otherSales:0,feeSum:0,recognizedTotal:0,vaUnmatched:0,
+      vaPgTax:0,vaPgVat:0,vaVan:0,cardPgTax:0,cardPgVat:0,cardVan:0});
 
   var chipDefs = [
     {cls:'va', label:'가상계좌 매출', val:grand.vaSales},
@@ -921,30 +948,40 @@ function renderDeferredPage(){
     {cls:'cash', label:'현금·은행 매출', val:grand.otherSales}
   ];
   if(taxed){
-    chipDefs.push({cls:'tax', label:'과세금액', val:grand.taxAmt});
-    chipDefs.push({cls:'tax', label:'부가세', val:grand.vat});
+    chipDefs.push({cls:'tax', label:'가상계좌 과세금액(PG)', val:grand.vaPgTax});
+    chipDefs.push({cls:'tax', label:'가상계좌 부가세(PG)', val:grand.vaPgVat});
+    chipDefs.push({cls:'tax', label:'카드 과세금액(PG)', val:grand.cardPgTax});
+    chipDefs.push({cls:'tax', label:'카드 부가세(PG)', val:grand.cardPgVat});
   }
-  chipDefs.push({cls:'total', label:'선수수익 인정액'+(taxed?'(과세금액 기준)':''), val:grand.recognizedTotal});
-  var chipWidth = Math.floor(100/chipDefs.length);
-  var chipTableHtml = '<table style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:8px 0;margin:12px 0 18px;"><tr>'+
-    chipDefs.map(function(c){
-      return '<td style="width:'+chipWidth+'%;padding:0;"><div class="chip '+c.cls+'" style="width:100%;box-sizing:border-box;white-space:nowrap;">'+c.label+'<b class="num">'+fmt(c.val)+'</b></div></td>';
-    }).join('')+
-  '</tr></table>';
+  chipDefs.push({cls:'total', label:'선수수익 인정액', val:grand.recognizedTotal});
+  var chipRowSize = chipDefs.length>8 ? 5 : chipDefs.length;
+  var chipTableHtml = '';
+  for(var ci=0; ci<chipDefs.length; ci+=chipRowSize){
+    var chipChunk = chipDefs.slice(ci, ci+chipRowSize);
+    var chipWidth = Math.floor(100/chipRowSize);
+    var isLastChipRow = ci+chipRowSize >= chipDefs.length;
+    chipTableHtml += '<table style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:8px 0;margin:'+(ci===0?'12px':'8px')+' 0 '+(isLastChipRow?'18px':'0')+';"><tr>'+
+      chipChunk.map(function(c){
+        return '<td style="width:'+chipWidth+'%;padding:0;"><div class="chip '+c.cls+'" style="width:100%;box-sizing:border-box;white-space:nowrap;">'+c.label+'<b class="num">'+fmt(c.val)+'</b></div></td>';
+      }).join('')+
+    '</tr></table>';
+  }
 
   var summaryHtml = '<div class="card"><div class="section-title">선택 항목 요약<span class="badge">'+selectedNames.length+'개 품목</span></div>'+
+    (taxed ? '<div class="hint" style="margin-bottom:8px;">세금계산서는 PG 결제분만 발행되므로 PG는 가상계좌/카드별로 과세금액·부가세를 나누고, VAN·현금·은행은 부가세 없이 금액 그대로 표시합니다. 인정매출액 = PG 과세금액 + VAN·현금·은행 금액.</div>' : '')+
     (grand.vaUnmatched ? '<div class="checkbar bad" style="margin-bottom:8px;">⚠️ 가상계좌(PG) 이체자 매칭 실패 '+grand.vaUnmatched+'건은 수수료 계산에서 제외되었습니다(이름/메모 불일치 가능성).</div>' : '')+
     chipTableHtml +
     '<div class="tableWrap"><table class="summaryTable"><thead><tr>'+
       '<th style="text-align:left">품목명</th><th>가상계좌매출</th><th>가상계좌수수료</th><th>카드매출</th><th>카드수수료</th><th>현금·은행매출</th><th>수수료합계</th>'+
-      (taxed ? '<th>과세금액</th><th>부가세</th>' : '')+'<th>인정비율</th><th>인정매출액'+(taxed?'(과세금액)':'')+'</th>'+
+      (taxed ? '<th>가상계좌 과세금액(PG)</th><th>가상계좌 부가세(PG)</th><th>가상계좌 VAN금액</th><th>카드 과세금액(PG)</th><th>카드 부가세(PG)</th><th>카드 VAN금액</th>' : '')+'<th>인정비율</th><th>인정매출액'+(taxed?'(PG는 과세금액)':'')+'</th>'+
     '</tr></thead><tbody>'+
     (rows.length ? rows.map(function(r){
       return '<tr><td style="text-align:left">'+esc(r.itemName)+'</td><td class="num">'+fmt(r.vaSales)+'</td><td class="num">'+fmt(r.vaFee)+(r.vaUnmatched?' <span style="color:var(--bad);font-size:10.5px;">(미매칭 '+r.vaUnmatched+')</span>':'')+'</td>'+
         '<td class="num">'+fmt(r.cardSales)+'</td><td class="num">'+fmt(r.cardFee)+'</td><td class="num">'+fmt(r.otherSales)+'</td><td class="num">'+fmt(r.feeSum)+'</td>'+
-        (taxed ? '<td class="num">'+fmt(r.tax.taxAmt)+'</td><td class="num">'+fmt(r.tax.vat)+'</td>' : '')+
+        (taxed ? '<td class="num">'+fmt(r.tx.vaPgTax)+'</td><td class="num">'+fmt(r.tx.vaPgVat)+'</td><td class="num">'+fmt(r.tx.vaVan)+'</td>'+
+                 '<td class="num">'+fmt(r.tx.cardPgTax)+'</td><td class="num">'+fmt(r.tx.cardPgVat)+'</td><td class="num">'+fmt(r.tx.cardVan)+'</td>' : '')+
         '<td class="num">'+Math.round(r.ratio*100)+'%</td><td class="num">'+fmt(r.recognizedTotal)+'</td></tr>';
-    }).join('') : '<tr><td colspan="'+(taxed?10:8)+'" style="text-align:center;color:var(--ink-soft)">선택된 품목이 없습니다</td></tr>')+
+    }).join('') : '<tr><td colspan="'+(taxed?15:9)+'" style="text-align:center;color:var(--ink-soft)">선택된 품목이 없습니다</td></tr>')+
     '</tbody></table></div></div>';
 
   wrap.innerHTML = '<div class="stickyBlock">'+tabsHtml + toolbarHtml+'</div>' + itemListHtml + summaryHtml;
@@ -1038,8 +1075,16 @@ function deferredSettleDateText(bizKey, c, idx){
 function exportDeferredDetail(bizKey, selectedNames, agg, sel, taxed, vaPgFeeMap, asOfDate){
   if(!selectedNames.length){ toast('선택된 품목이 없습니다.'); return; }
   var wb = XLSX.utils.book_new();
-  var aoa = [['품목명','결제일자','예입일자(정산일자)','이름','수험번호','승인번호/이체자','PG구분','기간배분','총횟수','잔여횟수','인정비율(%)',
-    '가상계좌매출분(인정비율 적용)','가상계좌수수료분(인정비율 적용)','카드매출분(인정비율 적용)','카드수수료분(인정비율 적용)','현금·은행매출분(인정비율 적용)','건별 합계(인정비율 적용)']];
+  var head = ['품목명','결제일자','예입일자(정산일자)','이름','수험번호','승인번호/이체자','PG구분','기간배분','총횟수','잔여횟수','인정비율(%)'];
+  if(taxed){
+    // 과세사업장(퀀텀2): PG 행만 가상계좌/카드별 과세금액·부가세가 채워지고, VAN 행은 세금계산서가 없어 금액만 나옴(세금 칸 비움)
+    head = head.concat(['가상계좌매출분(인정비율 적용)','가상계좌 과세금액(PG)','가상계좌 부가세(PG)','가상계좌수수료분(인정비율 적용)',
+      '카드매출분(인정비율 적용)','카드 과세금액(PG)','카드 부가세(PG)','카드수수료분(인정비율 적용)']);
+  } else {
+    head = head.concat(['가상계좌매출분(인정비율 적용)','가상계좌수수료분(인정비율 적용)','카드매출분(인정비율 적용)','카드수수료분(인정비율 적용)']);
+  }
+  head = head.concat(['현금·은행매출분(인정비율 적용)','건별 합계(인정비율 적용)']);
+  var aoa = [head];
   var grandCheck = 0;
   var feeAlloc = buildDeferredFeeAlloc(bizKey, agg, vaPgFeeMap, asOfDate); // 화면 표와 같은 품목별 수수료 배분
   var feeFin = finalizeDeferredFees(feeAlloc, agg, selectedNames, sel);
@@ -1054,11 +1099,23 @@ function exportDeferredDetail(bizKey, selectedNames, agg, sel, taxed, vaPgFeeMap
       var fn = feeFin.get(c);
       var vaFee = fn ? fn.va : 0;
       var cardFee = fn ? fn.card : 0;
-      var vaAmt = Math.round(c.vaShare*ratio), cardAmt = Math.round(c.cardShare*ratio), otherAmt = Math.round((c.otherShare||0)*ratio);
+      var amt = deferredContribAmounts(c, ratio);
+      var vaAmt = amt.va, cardAmt = amt.card, otherAmt = amt.other;
       grandCheck += vaAmt+cardAmt+otherAmt;
-      aoa.push([nm, r.date, deferredSettleDateText(bizKey, c, settleIdx), r.name, r.examNo, r.approvalNo||r.name, r.pg||'',
-        s.allocate?'Y':'N', s.allocate?s.totalCount:'', s.allocate?s.remainCount:'', ratioPct,
-        vaAmt, (a && a.vaMatched)?Math.round(vaFee):'매칭안됨', cardAmt, Math.round(cardFee), otherAmt, vaAmt+cardAmt+otherAmt]);
+      var vaFeeCell = (a && a.vaMatched) ? Math.round(vaFee) : '매칭안됨';
+      var cardFeeCell = Math.round(cardFee);
+      var rowHead = [nm, r.date, deferredSettleDateText(bizKey, c, settleIdx), r.name, r.examNo, r.approvalNo||r.name, r.pg||'',
+        s.allocate?'Y':'N', s.allocate?s.totalCount:'', s.allocate?s.remainCount:'', ratioPct];
+      var rowBody;
+      if(taxed){
+        var isPgRow = String(r.pg||'').toUpperCase()==='PG';
+        var vaT = (isPgRow && vaAmt) ? splitTax(vaAmt) : null;
+        var cardT = (isPgRow && cardAmt) ? splitTax(cardAmt) : null;
+        rowBody = [vaAmt, vaT?vaT.taxAmt:'', vaT?vaT.vat:'', vaFeeCell, cardAmt, cardT?cardT.taxAmt:'', cardT?cardT.vat:'', cardFeeCell];
+      } else {
+        rowBody = [vaAmt, vaFeeCell, cardAmt, cardFeeCell];
+      }
+      aoa.push(rowHead.concat(rowBody, [otherAmt, vaAmt+cardAmt+otherAmt]));
     });
   });
   var totalRow = new Array(aoa[0].length).fill('');
